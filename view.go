@@ -59,6 +59,10 @@ func (m model) View() string {
 		colWidth = 30
 	}
 
+	// compute per-session staleness for bubbling up to space rows.
+	// uses most recent pane activity per session (freshest pane wins).
+	sessionActivity := bestSessionActivity(m.tmuxPanes)
+
 	// render each display as a separate column
 	colStyle := lipgloss.NewStyle().Width(colWidth)
 	var styledColumns []string
@@ -67,7 +71,7 @@ func (m model) View() string {
 		if i == m.cursorCol {
 			activeRow = m.cursorRow
 		}
-		col := renderDisplayColumn(dg, activeRow, colWidth, m.tmuxByDisplay[dg.index])
+		col := renderDisplayColumn(dg, activeRow, colWidth, m.tmuxByDisplay[dg.index], sessionActivity)
 		styledColumns = append(styledColumns, colStyle.Render(col))
 	}
 
@@ -112,7 +116,7 @@ func (m model) View() string {
 
 // -- column rendering --
 
-func renderDisplayColumn(dg displayGroup, cursorRow int, colWidth int, tmuxPanes []TmuxPane) string {
+func renderDisplayColumn(dg displayGroup, cursorRow int, colWidth int, tmuxPanes []TmuxPane, sessionActivity map[string]time.Time) string {
 	var b strings.Builder
 
 	// header
@@ -133,7 +137,7 @@ func renderDisplayColumn(dg displayGroup, cursorRow int, colWidth int, tmuxPanes
 		relIdx := i + 1
 		absIdx := row.space.Index
 		isSelected := i == cursorRow
-		b.WriteString(renderSpaceRow(row, relIdx, absIdx, isSelected, maxTitleLen))
+		b.WriteString(renderSpaceRow(row, relIdx, absIdx, isSelected, maxTitleLen, sessionActivity))
 		b.WriteString("\n")
 	}
 
@@ -157,7 +161,7 @@ func renderDisplayColumn(dg displayGroup, cursorRow int, colWidth int, tmuxPanes
 
 // -- row rendering --
 
-func renderSpaceRow(row spaceRow, relIdx, absIdx int, isSelected bool, maxTitleLen int) string {
+func renderSpaceRow(row spaceRow, relIdx, absIdx int, isSelected bool, maxTitleLen int, sessionActivity map[string]time.Time) string {
 	cursor := "  "
 	if isSelected {
 		cursor = cursorStyle.Render("> ")
@@ -172,8 +176,29 @@ func renderSpaceRow(row spaceRow, relIdx, absIdx int, isSelected bool, maxTitleL
 		indicator = "\u00b7"
 	}
 
-	// relative index prominent, absolute in dim parens only when they differ
+	// compute worst (most stale) tmux session staleness on this space.
+	// terminal window titles match tmux session names via kitty/tmux title setting.
+	var worstActivity time.Time
+	hasTerminalSession := false
+	for _, w := range row.windows {
+		if !isTerminal(w.App) {
+			continue
+		}
+		if activity, ok := sessionActivity[w.Title]; ok {
+			if !hasTerminalSession || activity.Before(worstActivity) {
+				worstActivity = activity
+				hasTerminalSession = true
+			}
+		}
+	}
+
+	// relative index colored by space staleness when tmux sessions are present.
+	// worst session on the space determines the color.
 	indexStr := fmt.Sprintf("%2d", relIdx)
+	if hasTerminalSession {
+		spaceStyle := stalenessStyle(worstActivity)
+		indexStr = spaceStyle.Render(fmt.Sprintf("%2d", relIdx))
+	}
 	if relIdx != absIdx {
 		indexStr += dimStyle.Render(fmt.Sprintf("(%d)", absIdx))
 	}
@@ -184,14 +209,14 @@ func renderSpaceRow(row spaceRow, relIdx, absIdx int, isSelected bool, maxTitleL
 		label = dimStyle.Render(fmt.Sprintf("[%s] ", row.space.Label))
 	}
 
-	windowText := renderWindows(row.windows, maxTitleLen)
+	windowText := renderWindows(row.windows, maxTitleLen, sessionActivity)
 
 	return fmt.Sprintf("%s%s %s  %s%s", cursor, indexStr, indicator, label, windowText)
 }
 
 // -- window rendering --
 
-func renderWindows(windows []Window, maxTitleLen int) string {
+func renderWindows(windows []Window, maxTitleLen int, sessionActivity map[string]time.Time) string {
 	if len(windows) == 0 {
 		return dimStyle.Render("--")
 	}
@@ -209,14 +234,19 @@ func renderWindows(windows []Window, maxTitleLen int) string {
 
 	var parts []string
 
-	// terminals: green, app + title (title often reveals tmux session or cwd)
+	// terminals: colored by tmux session staleness (falls back to green
+	// if no matching session, e.g. terminal not running tmux)
 	for _, w := range terminals {
 		title := strings.TrimSpace(w.Title)
+		style := termStyle
+		if activity, ok := sessionActivity[title]; ok {
+			style = stalenessStyle(activity)
+		}
 		title = truncateStr(title, maxTitleLen)
 		if title != "" {
-			parts = append(parts, termStyle.Render(fmt.Sprintf("%s: %s", w.App, title)))
+			parts = append(parts, style.Render(fmt.Sprintf("%s: %s", w.App, title)))
 		} else {
-			parts = append(parts, termStyle.Render(w.App))
+			parts = append(parts, style.Render(w.App))
 		}
 	}
 
@@ -283,6 +313,22 @@ func truncateStr(s string, maxLen int) string {
 	return s
 }
 
+// -- tmux staleness --
+
+// bestSessionActivity maps session name → most recent pane activity.
+// the freshest pane represents the session's overall staleness (i.e. "when
+// was this session last touched"). used to color terminal window entries
+// in space rows and to compute worst-case staleness per space.
+func bestSessionActivity(panes []TmuxPane) map[string]time.Time {
+	result := make(map[string]time.Time)
+	for _, p := range panes {
+		if existing, ok := result[p.SessionName]; !ok || p.LastActivity.After(existing) {
+			result[p.SessionName] = p.LastActivity
+		}
+	}
+	return result
+}
+
 // -- tmux block rendering --
 
 type tmuxSessionGroup struct {
@@ -311,22 +357,22 @@ func groupPanesBySession(panes []TmuxPane) []tmuxSessionGroup {
 }
 
 // stalenessStyle returns a color style reflecting how recently a pane had output.
-// green (< 10s) → default (< 1m) → yellow (< 5m) → red (< 30m) → gray (30m+)
+// five tiers: green (<1m) → yellow (<5m) → orange (<15m) → dark orange (<1h) → red (1h+)
 func stalenessStyle(lastActivity time.Time) lipgloss.Style {
 	age := time.Since(lastActivity)
-	if age < 10*time.Second {
-		return lipgloss.NewStyle().Foreground(lipgloss.Color("2"))
-	}
 	if age < time.Minute {
-		return lipgloss.NewStyle()
+		return lipgloss.NewStyle().Foreground(lipgloss.Color("2"))
 	}
 	if age < 5*time.Minute {
 		return lipgloss.NewStyle().Foreground(lipgloss.Color("3"))
 	}
-	if age < 30*time.Minute {
-		return lipgloss.NewStyle().Foreground(lipgloss.Color("1"))
+	if age < 15*time.Minute {
+		return lipgloss.NewStyle().Foreground(lipgloss.Color("208"))
 	}
-	return lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+	if age < time.Hour {
+		return lipgloss.NewStyle().Foreground(lipgloss.Color("202"))
+	}
+	return lipgloss.NewStyle().Foreground(lipgloss.Color("1"))
 }
 
 // formatRelativeTime renders a duration since last activity as a compact string
