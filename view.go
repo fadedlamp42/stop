@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/lipgloss"
 )
@@ -66,7 +67,7 @@ func (m model) View() string {
 		if i == m.cursorCol {
 			activeRow = m.cursorRow
 		}
-		col := renderDisplayColumn(dg, activeRow, colWidth)
+		col := renderDisplayColumn(dg, activeRow, colWidth, m.tmuxByDisplay[dg.index])
 		styledColumns = append(styledColumns, colStyle.Render(col))
 	}
 
@@ -95,16 +96,9 @@ func (m model) View() string {
 		b.WriteString("\n")
 	}
 
-	// tmux sessions (global, below columns)
-	if len(m.tmux) > 0 {
-		var parts []string
-		for _, s := range m.tmux {
-			parts = append(parts, fmt.Sprintf("%s:%dw", s.Name, s.Windows))
-		}
-		b.WriteString("\n")
-		b.WriteString(pad)
-		b.WriteString(dimStyle.Render("tmux: " + strings.Join(parts, "  ")))
-		b.WriteString("\n")
+	// detached tmux sessions (not attached to any terminal on a display)
+	if len(m.detachedTmux) > 0 {
+		b.WriteString(renderTmuxSessions(m.detachedTmux, "detached"))
 	}
 
 	// keybinds
@@ -118,7 +112,7 @@ func (m model) View() string {
 
 // -- column rendering --
 
-func renderDisplayColumn(dg displayGroup, cursorRow int, colWidth int) string {
+func renderDisplayColumn(dg displayGroup, cursorRow int, colWidth int, tmuxPanes []TmuxPane) string {
 	var b strings.Builder
 
 	// header
@@ -152,6 +146,11 @@ func renderDisplayColumn(dg displayGroup, cursorRow int, colWidth int) string {
 	}
 	b.WriteString("  ")
 	b.WriteString(fmt.Sprintf("%d terminals", dg.termCount))
+
+	// tmux sessions on this display
+	if len(tmuxPanes) > 0 {
+		b.WriteString(renderTmuxSessions(tmuxPanes, "tmux"))
+	}
 
 	return b.String()
 }
@@ -282,4 +281,134 @@ func truncateStr(s string, maxLen int) string {
 		return s[:maxLen-3] + "..."
 	}
 	return s
+}
+
+// -- tmux block rendering --
+
+type tmuxSessionGroup struct {
+	name  string
+	panes []TmuxPane
+}
+
+// groupPanesBySession preserves tmux's natural session ordering
+func groupPanesBySession(panes []TmuxPane) []tmuxSessionGroup {
+	sessionMap := make(map[string][]TmuxPane)
+	var sessionOrder []string
+	for _, p := range panes {
+		if _, exists := sessionMap[p.SessionName]; !exists {
+			sessionOrder = append(sessionOrder, p.SessionName)
+		}
+		sessionMap[p.SessionName] = append(sessionMap[p.SessionName], p)
+	}
+	var groups []tmuxSessionGroup
+	for _, name := range sessionOrder {
+		groups = append(groups, tmuxSessionGroup{
+			name:  name,
+			panes: sessionMap[name],
+		})
+	}
+	return groups
+}
+
+// stalenessStyle returns a color style reflecting how recently a pane had output.
+// green (< 10s) → default (< 1m) → yellow (< 5m) → red (< 30m) → gray (30m+)
+func stalenessStyle(lastActivity time.Time) lipgloss.Style {
+	age := time.Since(lastActivity)
+	if age < 10*time.Second {
+		return lipgloss.NewStyle().Foreground(lipgloss.Color("2"))
+	}
+	if age < time.Minute {
+		return lipgloss.NewStyle()
+	}
+	if age < 5*time.Minute {
+		return lipgloss.NewStyle().Foreground(lipgloss.Color("3"))
+	}
+	if age < 30*time.Minute {
+		return lipgloss.NewStyle().Foreground(lipgloss.Color("1"))
+	}
+	return lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+}
+
+// formatRelativeTime renders a duration since last activity as a compact string
+func formatRelativeTime(t time.Time) string {
+	age := time.Since(t)
+	if age < 5*time.Second {
+		return "now"
+	}
+	if age < time.Minute {
+		return fmt.Sprintf("%ds", int(age.Seconds()))
+	}
+	if age < time.Hour {
+		return fmt.Sprintf("%dm", int(age.Minutes()))
+	}
+	if age < 24*time.Hour {
+		return fmt.Sprintf("%dh", int(age.Hours()))
+	}
+	return fmt.Sprintf("%dd", int(age.Hours()/24))
+}
+
+// formatHistorySize renders scroll buffer line count compactly
+func formatHistorySize(lines int) string {
+	if lines < 1000 {
+		return fmt.Sprintf("%d", lines)
+	}
+	if lines < 10000 {
+		return fmt.Sprintf("%.1fk", float64(lines)/1000)
+	}
+	return fmt.Sprintf("%dk", lines/1000)
+}
+
+// renderTmuxSessions renders tmux panes grouped by session with staleness
+// coloring, scroll buffer sizes, and time since last activity.
+// header is the section label (e.g. "tmux" or "detached").
+func renderTmuxSessions(panes []TmuxPane, header string) string {
+	if len(panes) == 0 {
+		return ""
+	}
+	sessions := groupPanesBySession(panes)
+
+	var b strings.Builder
+	b.WriteString("\n")
+	b.WriteString(dimStyle.Render(header))
+	b.WriteString("\n")
+
+	for _, session := range sessions {
+		b.WriteString("  ")
+		b.WriteString(session.name)
+		b.WriteString("\n")
+
+		// compute alignment widths within this session
+		maxCmdLen := 0
+		maxTimeLen := 0
+		maxBufLen := 0
+		for _, p := range session.panes {
+			if len(p.CurrentCommand) > maxCmdLen {
+				maxCmdLen = len(p.CurrentCommand)
+			}
+			timeStr := formatRelativeTime(p.LastActivity)
+			if len(timeStr) > maxTimeLen {
+				maxTimeLen = len(timeStr)
+			}
+			bufStr := formatHistorySize(p.HistorySize)
+			if len(bufStr) > maxBufLen {
+				maxBufLen = len(bufStr)
+			}
+		}
+
+		for _, p := range session.panes {
+			style := stalenessStyle(p.LastActivity)
+			paddedCmd := fmt.Sprintf("%-*s", maxCmdLen, p.CurrentCommand)
+			timeStr := formatRelativeTime(p.LastActivity)
+			bufStr := formatHistorySize(p.HistorySize)
+
+			b.WriteString("    ")
+			b.WriteString(style.Render("\u258e"))
+			b.WriteString(" ")
+			b.WriteString(style.Render(paddedCmd))
+			b.WriteString("  ")
+			b.WriteString(dimStyle.Render(fmt.Sprintf("%*s  %*s", maxTimeLen, timeStr, maxBufLen, bufStr)))
+			b.WriteString("\n")
+		}
+	}
+	return b.String()
 }

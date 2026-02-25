@@ -40,12 +40,16 @@ type spaceRow struct {
 
 type model struct {
 	// raw data from queries
-	spaces  []Space
-	windows []Window
-	tmux    []TmuxSession
+	spaces      []Space
+	windows     []Window
+	tmuxPanes   []TmuxPane
+	tmuxClients []TmuxClient
+	processTree map[int]int
 
 	// derived (rebuilt on each data refresh)
 	displayGroups []displayGroup
+	tmuxByDisplay map[int][]TmuxPane // display index → panes on that display
+	detachedTmux  []TmuxPane         // sessions not attached to any terminal
 
 	// cursor: (col, row) where col = display index, row = space within display
 	cursorCol int
@@ -138,10 +142,16 @@ func (m model) handleData(result fetchResult) (tea.Model, tea.Cmd) {
 	}
 	m.spaces = result.spaces
 	m.windows = result.windows
-	m.tmux = result.tmux
+	m.tmuxPanes = result.tmuxPanes
+	m.tmuxClients = result.tmuxClients
+	m.processTree = result.processTree
 	m.err = nil
 	m.ready = true
 	m.displayGroups = buildDisplayGroups(m.spaces, m.windows)
+
+	// map tmux sessions to displays via process tree walk
+	m.tmuxByDisplay, m.detachedTmux = partitionTmuxByDisplay(
+		m.tmuxPanes, m.tmuxClients, m.processTree, m.windows, m.displayGroups)
 
 	// clamp cursor after data change (spaces may have been added/removed)
 	if len(m.displayGroups) == 0 {
@@ -220,6 +230,104 @@ func buildDisplayGroups(spaces []Space, windows []Window) []displayGroup {
 	}
 
 	return groups
+}
+
+// -- tmux-to-display mapping --
+
+// partitionTmuxByDisplay correlates tmux sessions to yabai displays.
+// walks from each tmux client PID up the process tree to find the terminal
+// emulator's PID, which matches a yabai window PID → space → display.
+// when multiple windows share a PID (e.g. kitty is single-process),
+// disambiguates by matching window title to tmux session name.
+// sessions without an attached client (or unmappable) go into detached.
+func partitionTmuxByDisplay(
+	panes []TmuxPane,
+	clients []TmuxClient,
+	processTree map[int]int,
+	windows []Window,
+	groups []displayGroup,
+) (byDisplay map[int][]TmuxPane, detached []TmuxPane) {
+	byDisplay = make(map[int][]TmuxPane)
+
+	if len(panes) == 0 {
+		return byDisplay, nil
+	}
+
+	// build space → display lookup
+	spaceToDisplay := make(map[int]int)
+	for _, g := range groups {
+		for _, row := range g.spaces {
+			spaceToDisplay[row.space.Index] = g.index
+		}
+	}
+
+	// group terminal windows by PID with their display info.
+	// kitty is single-process so all its OS windows share one PID.
+	type windowInfo struct {
+		title   string
+		display int
+	}
+	windowsByPID := make(map[int][]windowInfo)
+	for _, w := range windows {
+		if !isTerminal(w.App) {
+			continue
+		}
+		if display, ok := spaceToDisplay[w.Space]; ok {
+			windowsByPID[w.PID] = append(windowsByPID[w.PID], windowInfo{
+				title:   w.Title,
+				display: display,
+			})
+		}
+	}
+
+	// for each tmux client, walk up process tree to find terminal PID,
+	// then resolve to a specific window/display
+	sessionToDisplay := make(map[string]int)
+	for _, client := range clients {
+		termPID := -1
+		pid := client.PID
+		for depth := 0; depth < 20; depth++ {
+			if _, ok := windowsByPID[pid]; ok {
+				termPID = pid
+				break
+			}
+			ppid, ok := processTree[pid]
+			if !ok || ppid <= 1 {
+				break
+			}
+			pid = ppid
+		}
+
+		if termPID < 0 {
+			continue
+		}
+
+		wins := windowsByPID[termPID]
+		if len(wins) == 1 {
+			// single window for this PID — unambiguous
+			sessionToDisplay[client.SessionName] = wins[0].display
+		} else {
+			// multiple windows share this PID (e.g. kitty)
+			// match window title to session name
+			for _, wi := range wins {
+				if wi.title == client.SessionName {
+					sessionToDisplay[client.SessionName] = wi.display
+					break
+				}
+			}
+		}
+	}
+
+	// partition panes into per-display buckets or detached
+	for _, p := range panes {
+		if display, ok := sessionToDisplay[p.SessionName]; ok {
+			byDisplay[display] = append(byDisplay[display], p)
+		} else {
+			detached = append(detached, p)
+		}
+	}
+
+	return byDisplay, detached
 }
 
 // -- navigation --

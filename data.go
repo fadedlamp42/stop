@@ -87,10 +87,15 @@ type Window struct {
 	IsHidden    bool   `json:"is-hidden"`
 }
 
-// TmuxSession holds a tmux session name and its window count
-type TmuxSession struct {
-	Name    string
-	Windows int
+// TmuxPane holds per-pane data from tmux including staleness and buffer info
+type TmuxPane struct {
+	SessionName    string
+	WindowIndex    int
+	WindowName     string
+	PaneIndex      int
+	CurrentCommand string
+	LastActivity   time.Time
+	HistorySize    int // lines in scroll buffer
 }
 
 // -- queries --
@@ -119,27 +124,98 @@ func queryWindows() ([]Window, error) {
 	return windows, json.Unmarshal(data, &windows)
 }
 
-func queryTmuxSessions() []TmuxSession {
+// queryTmuxPanes fetches per-pane data from all tmux sessions.
+// returns nil if tmux is not running or has no sessions.
+func queryTmuxPanes() []TmuxPane {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, "tmux", "list-sessions", "-F", "#{session_name} #{session_windows}").Output()
+	out, err := exec.CommandContext(ctx, "tmux", "list-panes", "-a", "-F",
+		"#{session_name}\t#{window_index}\t#{window_name}\t#{pane_index}\t#{pane_current_command}\t#{window_activity}\t#{history_size}").Output()
 	if err != nil {
 		return nil
 	}
-	var sessions []TmuxSession
+	var panes []TmuxPane
 	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
 		if line == "" {
 			continue
 		}
-		parts := strings.SplitN(line, " ", 2)
-		if len(parts) != 2 {
+		parts := strings.Split(line, "\t")
+		if len(parts) < 7 {
 			continue
 		}
-		var windowCount int
-		fmt.Sscanf(parts[1], "%d", &windowCount)
-		sessions = append(sessions, TmuxSession{Name: parts[0], Windows: windowCount})
+		var windowIndex, paneIndex, historySize int
+		var activityEpoch int64
+		fmt.Sscanf(parts[1], "%d", &windowIndex)
+		fmt.Sscanf(parts[3], "%d", &paneIndex)
+		fmt.Sscanf(parts[5], "%d", &activityEpoch)
+		fmt.Sscanf(parts[6], "%d", &historySize)
+		panes = append(panes, TmuxPane{
+			SessionName:    parts[0],
+			WindowIndex:    windowIndex,
+			WindowName:     parts[2],
+			PaneIndex:      paneIndex,
+			CurrentCommand: parts[4],
+			LastActivity:   time.Unix(activityEpoch, 0),
+			HistorySize:    historySize,
+		})
 	}
-	return sessions
+	return panes
+}
+
+// TmuxClient maps a tmux client process to its session.
+// used to correlate tmux sessions with terminal windows via process tree.
+type TmuxClient struct {
+	PID         int
+	SessionName string
+}
+
+// queryTmuxClients fetches the PID and session name for each attached tmux client.
+// returns nil if tmux is not running or has no attached clients.
+func queryTmuxClients() []TmuxClient {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "tmux", "list-clients", "-F",
+		"#{client_pid}\t#{session_name}").Output()
+	if err != nil {
+		return nil
+	}
+	var clients []TmuxClient
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if line == "" {
+			continue
+		}
+		parts := strings.Split(line, "\t")
+		if len(parts) < 2 {
+			continue
+		}
+		var pid int
+		fmt.Sscanf(parts[0], "%d", &pid)
+		clients = append(clients, TmuxClient{PID: pid, SessionName: parts[1]})
+	}
+	return clients
+}
+
+// queryProcessTree returns a pid → ppid map for all running processes.
+// used to walk from tmux client PIDs up to terminal emulator PIDs.
+func queryProcessTree() map[int]int {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "ps", "-eo", "pid,ppid").Output()
+	if err != nil {
+		return nil
+	}
+	tree := make(map[int]int)
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "PID") {
+			continue
+		}
+		var pid, ppid int
+		if _, err := fmt.Sscanf(line, "%d %d", &pid, &ppid); err == nil {
+			tree[pid] = ppid
+		}
+	}
+	return tree
 }
 
 // focusSpace tells yabai to switch focus to a specific space index
@@ -153,25 +229,29 @@ func focusSpace(index int) {
 
 // fetchResult holds the combined result of all concurrent queries
 type fetchResult struct {
-	spaces  []Space
-	windows []Window
-	tmux    []TmuxSession
-	err     error
+	spaces      []Space
+	windows     []Window
+	tmuxPanes   []TmuxPane
+	tmuxClients []TmuxClient
+	processTree map[int]int
+	err         error
 }
 
 // fetchAll queries yabai (spaces + windows) and tmux concurrently.
 // spaces query is required; windows and tmux are best-effort.
 func fetchAll() fetchResult {
 	var (
-		spaces   []Space
-		windows  []Window
-		tmux     []TmuxSession
-		spaceErr error
-		mu       sync.Mutex
-		wg       sync.WaitGroup
+		spaces      []Space
+		windows     []Window
+		tmuxPanes   []TmuxPane
+		tmuxClients []TmuxClient
+		processTree map[int]int
+		spaceErr    error
+		mu          sync.Mutex
+		wg          sync.WaitGroup
 	)
 
-	wg.Add(3)
+	wg.Add(5)
 
 	go func() {
 		defer wg.Done()
@@ -191,9 +271,25 @@ func fetchAll() fetchResult {
 
 	go func() {
 		defer wg.Done()
-		t := queryTmuxSessions()
+		t := queryTmuxPanes()
 		mu.Lock()
-		tmux = t
+		tmuxPanes = t
+		mu.Unlock()
+	}()
+
+	go func() {
+		defer wg.Done()
+		c := queryTmuxClients()
+		mu.Lock()
+		tmuxClients = c
+		mu.Unlock()
+	}()
+
+	go func() {
+		defer wg.Done()
+		t := queryProcessTree()
+		mu.Lock()
+		processTree = t
 		mu.Unlock()
 	}()
 
@@ -203,5 +299,11 @@ func fetchAll() fetchResult {
 	if spaceErr != nil {
 		return fetchResult{err: spaceErr}
 	}
-	return fetchResult{spaces: spaces, windows: windows, tmux: tmux}
+	return fetchResult{
+		spaces:      spaces,
+		windows:     windows,
+		tmuxPanes:   tmuxPanes,
+		tmuxClients: tmuxClients,
+		processTree: processTree,
+	}
 }
