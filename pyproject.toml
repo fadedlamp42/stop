@@ -1,0 +1,18 @@
+[tool.poetry]
+name = "stop"
+version = "0.1.0"
+description = "top, but for spaces"
+authors = ["Peter Ward"]
+license = "MIT"
+readme = "README.md"
+packages = [{include = "stop", from = "src"}]
+
+[tool.poetry.scripts]
+stop = "stop.main:cli"
+
+[tool.poetry.dependencies]
+python = ">=3.10"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
