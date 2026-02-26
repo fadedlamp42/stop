@@ -24,7 +24,6 @@ import (
 var (
 	displayStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("6")).Bold(true)
 	dimStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
-	termStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("2"))
 	cursorStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("6"))
 	freeStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("2"))
 	warnStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("3"))
@@ -61,7 +60,7 @@ func (m model) View() string {
 
 	// compute per-session staleness for bubbling up to space rows.
 	// uses most recent pane activity per session (freshest pane wins).
-	sessionActivity := bestSessionActivity(m.tmuxPanes)
+	productiveActivity := bestProductiveActivity(m.tmuxPanes)
 
 	// render each display as a separate column
 	colStyle := lipgloss.NewStyle().Width(colWidth)
@@ -71,7 +70,7 @@ func (m model) View() string {
 		if i == m.cursorCol {
 			activeRow = m.cursorRow
 		}
-		col := renderDisplayColumn(dg, activeRow, colWidth, m.tmuxByDisplay[dg.index], sessionActivity)
+		col := renderDisplayColumn(dg, activeRow, colWidth, m.tmuxByDisplay[dg.index], productiveActivity)
 		styledColumns = append(styledColumns, colStyle.Render(col))
 	}
 
@@ -116,7 +115,7 @@ func (m model) View() string {
 
 // -- column rendering --
 
-func renderDisplayColumn(dg displayGroup, cursorRow int, colWidth int, tmuxPanes []TmuxPane, sessionActivity map[string]time.Time) string {
+func renderDisplayColumn(dg displayGroup, cursorRow int, colWidth int, tmuxPanes []TmuxPane, productiveActivity map[string]time.Time) string {
 	var b strings.Builder
 
 	// header
@@ -137,7 +136,7 @@ func renderDisplayColumn(dg displayGroup, cursorRow int, colWidth int, tmuxPanes
 		relIdx := i + 1
 		absIdx := row.space.Index
 		isSelected := i == cursorRow
-		b.WriteString(renderSpaceRow(row, relIdx, absIdx, isSelected, maxTitleLen, sessionActivity))
+		b.WriteString(renderSpaceRow(row, relIdx, absIdx, isSelected, maxTitleLen, productiveActivity))
 		b.WriteString("\n")
 	}
 
@@ -161,7 +160,7 @@ func renderDisplayColumn(dg displayGroup, cursorRow int, colWidth int, tmuxPanes
 
 // -- row rendering --
 
-func renderSpaceRow(row spaceRow, relIdx, absIdx int, isSelected bool, maxTitleLen int, sessionActivity map[string]time.Time) string {
+func renderSpaceRow(row spaceRow, relIdx, absIdx int, isSelected bool, maxTitleLen int, productiveActivity map[string]time.Time) string {
 	cursor := "  "
 	if isSelected {
 		cursor = cursorStyle.Render("> ")
@@ -176,28 +175,26 @@ func renderSpaceRow(row spaceRow, relIdx, absIdx int, isSelected bool, maxTitleL
 		indicator = "\u00b7"
 	}
 
-	// compute worst (most stale) tmux session staleness on this space.
-	// terminal window titles match tmux session names via kitty/tmux title setting.
-	var worstActivity time.Time
-	hasTerminalSession := false
+	// compute worst (most stale) productive session on this space.
+	// only productive panes contribute — bash/btop sitting idle isn't meaningful.
+	var worstProductiveActivity time.Time
+	hasProductiveSession := false
 	for _, w := range row.windows {
 		if !isTerminal(w.App) {
 			continue
 		}
-		if activity, ok := sessionActivity[w.Title]; ok {
-			if !hasTerminalSession || activity.Before(worstActivity) {
-				worstActivity = activity
-				hasTerminalSession = true
+		if activity, ok := productiveActivity[w.Title]; ok {
+			if !hasProductiveSession || activity.Before(worstProductiveActivity) {
+				worstProductiveActivity = activity
+				hasProductiveSession = true
 			}
 		}
 	}
 
-	// relative index colored by space staleness when tmux sessions are present.
-	// worst session on the space determines the color.
+	// relative index colored only when productive work is happening on this space
 	indexStr := fmt.Sprintf("%2d", relIdx)
-	if hasTerminalSession {
-		spaceStyle := stalenessStyle(worstActivity)
-		indexStr = spaceStyle.Render(fmt.Sprintf("%2d", relIdx))
+	if hasProductiveSession {
+		indexStr = stalenessStyle(worstProductiveActivity).Render(fmt.Sprintf("%2d", relIdx))
 	}
 	if relIdx != absIdx {
 		indexStr += dimStyle.Render(fmt.Sprintf("(%d)", absIdx))
@@ -209,14 +206,14 @@ func renderSpaceRow(row spaceRow, relIdx, absIdx int, isSelected bool, maxTitleL
 		label = dimStyle.Render(fmt.Sprintf("[%s] ", row.space.Label))
 	}
 
-	windowText := renderWindows(row.windows, maxTitleLen, sessionActivity)
+	windowText := renderWindows(row.windows, maxTitleLen, productiveActivity)
 
 	return fmt.Sprintf("%s%s %s  %s%s", cursor, indexStr, indicator, label, windowText)
 }
 
 // -- window rendering --
 
-func renderWindows(windows []Window, maxTitleLen int, sessionActivity map[string]time.Time) string {
+func renderWindows(windows []Window, maxTitleLen int, productiveActivity map[string]time.Time) string {
 	if len(windows) == 0 {
 		return dimStyle.Render("--")
 	}
@@ -234,19 +231,23 @@ func renderWindows(windows []Window, maxTitleLen int, sessionActivity map[string
 
 	var parts []string
 
-	// terminals: colored by tmux session staleness (falls back to green
-	// if no matching session, e.g. terminal not running tmux)
+	// terminals: only colored when session has productive activity.
+	// non-productive sessions render plain — their staleness is meaningless.
 	for _, w := range terminals {
-		title := strings.TrimSpace(w.Title)
-		style := termStyle
-		if activity, ok := sessionActivity[title]; ok {
-			style = stalenessStyle(activity)
-		}
-		title = truncateStr(title, maxTitleLen)
-		if title != "" {
-			parts = append(parts, style.Render(fmt.Sprintf("%s: %s", w.App, title)))
+		rawTitle := strings.TrimSpace(w.Title)
+		displayTitle := truncateStr(rawTitle, maxTitleLen)
+
+		var entry string
+		if displayTitle != "" {
+			entry = fmt.Sprintf("%s: %s", w.App, displayTitle)
 		} else {
-			parts = append(parts, style.Render(w.App))
+			entry = w.App
+		}
+
+		if activity, ok := productiveActivity[rawTitle]; ok {
+			parts = append(parts, stalenessStyle(activity).Render(entry))
+		} else {
+			parts = append(parts, entry)
 		}
 	}
 
@@ -315,13 +316,16 @@ func truncateStr(s string, maxLen int) string {
 
 // -- tmux staleness --
 
-// bestSessionActivity maps session name → most recent pane activity.
-// the freshest pane represents the session's overall staleness (i.e. "when
-// was this session last touched"). used to color terminal window entries
-// in space rows and to compute worst-case staleness per space.
-func bestSessionActivity(panes []TmuxPane) map[string]time.Time {
+// bestProductiveActivity maps session name → most recent productive pane activity.
+// only panes running a productive command (see config.go) contribute.
+// used to color terminal entries and space index numbers — non-productive
+// panes are ignored since their staleness is meaningless.
+func bestProductiveActivity(panes []TmuxPane) map[string]time.Time {
 	result := make(map[string]time.Time)
 	for _, p := range panes {
+		if !isProductive(p.CurrentCommand) {
+			continue
+		}
 		if existing, ok := result[p.SessionName]; !ok || p.LastActivity.After(existing) {
 			result[p.SessionName] = p.LastActivity
 		}
@@ -331,12 +335,19 @@ func bestSessionActivity(panes []TmuxPane) map[string]time.Time {
 
 // -- tmux block rendering --
 
-type tmuxSessionGroup struct {
+type tmuxWindowGroup struct {
+	index int
 	name  string
 	panes []TmuxPane
 }
 
-// groupPanesBySession preserves tmux's natural session ordering
+type tmuxSessionGroup struct {
+	name    string
+	windows []tmuxWindowGroup
+}
+
+// groupPanesBySession groups panes into session → window → pane hierarchy,
+// preserving tmux's natural ordering at each level
 func groupPanesBySession(panes []TmuxPane) []tmuxSessionGroup {
 	sessionMap := make(map[string][]TmuxPane)
 	var sessionOrder []string
@@ -349,8 +360,31 @@ func groupPanesBySession(panes []TmuxPane) []tmuxSessionGroup {
 	var groups []tmuxSessionGroup
 	for _, name := range sessionOrder {
 		groups = append(groups, tmuxSessionGroup{
-			name:  name,
-			panes: sessionMap[name],
+			name:    name,
+			windows: groupPanesByWindow(sessionMap[name]),
+		})
+	}
+	return groups
+}
+
+// groupPanesByWindow splits a session's panes into per-window groups
+func groupPanesByWindow(panes []TmuxPane) []tmuxWindowGroup {
+	windowMap := make(map[int][]TmuxPane)
+	windowNames := make(map[int]string)
+	var windowOrder []int
+	for _, p := range panes {
+		if _, exists := windowMap[p.WindowIndex]; !exists {
+			windowOrder = append(windowOrder, p.WindowIndex)
+		}
+		windowMap[p.WindowIndex] = append(windowMap[p.WindowIndex], p)
+		windowNames[p.WindowIndex] = p.WindowName
+	}
+	var groups []tmuxWindowGroup
+	for _, idx := range windowOrder {
+		groups = append(groups, tmuxWindowGroup{
+			index: idx,
+			name:  windowNames[idx],
+			panes: windowMap[idx],
 		})
 	}
 	return groups
@@ -423,37 +457,66 @@ func renderTmuxSessions(panes []TmuxPane, header string) string {
 		b.WriteString(session.name)
 		b.WriteString("\n")
 
-		// compute alignment widths within this session
+		// compute alignment widths across all panes in the session
+		// so columns line up across windows
 		maxCmdLen := 0
 		maxTimeLen := 0
 		maxBufLen := 0
-		for _, p := range session.panes {
-			if len(p.CurrentCommand) > maxCmdLen {
-				maxCmdLen = len(p.CurrentCommand)
-			}
-			timeStr := formatRelativeTime(p.LastActivity)
-			if len(timeStr) > maxTimeLen {
-				maxTimeLen = len(timeStr)
-			}
-			bufStr := formatHistorySize(p.HistorySize)
-			if len(bufStr) > maxBufLen {
-				maxBufLen = len(bufStr)
+		for _, window := range session.windows {
+			for _, p := range window.panes {
+				if len(p.CurrentCommand) > maxCmdLen {
+					maxCmdLen = len(p.CurrentCommand)
+				}
+				timeStr := formatRelativeTime(p.LastActivity)
+				if len(timeStr) > maxTimeLen {
+					maxTimeLen = len(timeStr)
+				}
+				bufStr := formatHistorySize(p.HistorySize)
+				if len(bufStr) > maxBufLen {
+					maxBufLen = len(bufStr)
+				}
 			}
 		}
 
-		for _, p := range session.panes {
-			style := stalenessStyle(p.LastActivity)
-			paddedCmd := fmt.Sprintf("%-*s", maxCmdLen, p.CurrentCommand)
-			timeStr := formatRelativeTime(p.LastActivity)
-			bufStr := formatHistorySize(p.HistorySize)
-
+		for _, window := range session.windows {
+			// window header — colored by best productive pane if any
+			windowLabel := fmt.Sprintf("%d:%s", window.index, window.name)
+			var bestProductive time.Time
+			windowHasProductive := false
+			for _, p := range window.panes {
+				if isProductive(p.CurrentCommand) {
+					if !windowHasProductive || p.LastActivity.After(bestProductive) {
+						bestProductive = p.LastActivity
+						windowHasProductive = true
+					}
+				}
+			}
 			b.WriteString("    ")
-			b.WriteString(style.Render("\u258e"))
-			b.WriteString(" ")
-			b.WriteString(style.Render(paddedCmd))
-			b.WriteString("  ")
-			b.WriteString(dimStyle.Render(fmt.Sprintf("%*s  %*s", maxTimeLen, timeStr, maxBufLen, bufStr)))
+			if windowHasProductive {
+				b.WriteString(stalenessStyle(bestProductive).Render(windowLabel))
+			} else {
+				b.WriteString(dimStyle.Render(windowLabel))
+			}
 			b.WriteString("\n")
+
+			// panes within window — only productive ones get staleness color
+			for _, p := range window.panes {
+				style := dimStyle
+				if isProductive(p.CurrentCommand) {
+					style = stalenessStyle(p.LastActivity)
+				}
+				paddedCmd := fmt.Sprintf("%-*s", maxCmdLen, p.CurrentCommand)
+				timeStr := formatRelativeTime(p.LastActivity)
+				bufStr := formatHistorySize(p.HistorySize)
+
+				b.WriteString("      ")
+				b.WriteString(style.Render("\u258e"))
+				b.WriteString(" ")
+				b.WriteString(style.Render(paddedCmd))
+				b.WriteString("  ")
+				b.WriteString(dimStyle.Render(fmt.Sprintf("%*s  %*s", maxTimeLen, timeStr, maxBufLen, bufStr)))
+				b.WriteString("\n")
+			}
 		}
 	}
 	return b.String()
