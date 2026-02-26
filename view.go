@@ -457,29 +457,8 @@ func renderTmuxSessions(panes []TmuxPane, header string) string {
 		b.WriteString(session.name)
 		b.WriteString("\n")
 
-		// compute alignment widths across all panes in the session
-		// so columns line up across windows
-		maxCmdLen := 0
-		maxTimeLen := 0
-		maxBufLen := 0
 		for _, window := range session.windows {
-			for _, p := range window.panes {
-				if len(p.CurrentCommand) > maxCmdLen {
-					maxCmdLen = len(p.CurrentCommand)
-				}
-				timeStr := formatRelativeTime(p.LastActivity)
-				if len(timeStr) > maxTimeLen {
-					maxTimeLen = len(timeStr)
-				}
-				bufStr := formatHistorySize(p.HistorySize)
-				if len(bufStr) > maxBufLen {
-					maxBufLen = len(bufStr)
-				}
-			}
-		}
-
-		for _, window := range session.windows {
-			// window header — colored by best productive pane if any
+			// window label — colored by best productive pane if any
 			windowLabel := fmt.Sprintf("%d:%s", window.index, window.name)
 			var bestProductive time.Time
 			windowHasProductive := false
@@ -491,32 +470,29 @@ func renderTmuxSessions(panes []TmuxPane, header string) string {
 					}
 				}
 			}
+
 			b.WriteString("    ")
 			if windowHasProductive {
 				b.WriteString(stalenessStyle(bestProductive).Render(windowLabel))
 			} else {
 				b.WriteString(dimStyle.Render(windowLabel))
 			}
-			b.WriteString("\n")
 
-			// panes within window — only productive ones get staleness color
+			// panes inline on the same line as the window header
 			for _, p := range window.panes {
 				style := dimStyle
 				if isProductive(p.CurrentCommand) {
 					style = stalenessStyle(p.LastActivity)
 				}
-				paddedCmd := fmt.Sprintf("%-*s", maxCmdLen, p.CurrentCommand)
 				timeStr := formatRelativeTime(p.LastActivity)
-				bufStr := formatHistorySize(p.HistorySize)
-
-				b.WriteString("      ")
+				b.WriteString("  ")
 				b.WriteString(style.Render("\u258e"))
 				b.WriteString(" ")
-				b.WriteString(style.Render(paddedCmd))
-				b.WriteString("  ")
-				b.WriteString(dimStyle.Render(fmt.Sprintf("%*s  %*s", maxTimeLen, timeStr, maxBufLen, bufStr)))
-				b.WriteString("\n")
+				b.WriteString(style.Render(p.CurrentCommand))
+				b.WriteString(" ")
+				b.WriteString(dimStyle.Render(timeStr))
 			}
+			b.WriteString("\n")
 		}
 	}
 	return b.String()
