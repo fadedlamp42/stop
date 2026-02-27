@@ -11,7 +11,10 @@
 package main
 
 import (
+	"os"
+	"os/signal"
 	"sort"
+	"syscall"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -21,6 +24,18 @@ import (
 
 type dataMsg fetchResult
 type tickMsg time.Time
+
+// spaceChangedMsg is sent when yabai reports a space/display focus change via SIGUSR1
+type spaceChangedMsg struct{}
+
+// signalCh receives SIGUSR1 from yabai space_changed / display_changed signals.
+// registered at init so the signal is always captured — prevents default
+// termination in serve mode even when nobody reads from the channel.
+var signalCh = make(chan os.Signal, 1)
+
+func init() {
+	signal.Notify(signalCh, syscall.SIGUSR1)
+}
 
 // -- derived view data --
 
@@ -66,7 +81,7 @@ func newModel() model {
 }
 
 func (m model) Init() tea.Cmd {
-	return tea.Batch(fetchCmd, tickCmd())
+	return tea.Batch(fetchCmd, tickCmd(), waitForSignalCmd)
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -81,6 +96,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.handleData(fetchResult(msg))
 	case tickMsg:
 		return m, tea.Batch(fetchCmd, tickCmd())
+	case spaceChangedMsg:
+		return m, tea.Batch(fetchCmd, waitForSignalCmd)
 	}
 	return m, nil
 }
@@ -353,6 +370,13 @@ func tickCmd() tea.Cmd {
 	return tea.Tick(2*time.Second, func(t time.Time) tea.Msg {
 		return tickMsg(t)
 	})
+}
+
+// waitForSignalCmd blocks until SIGUSR1 arrives, then returns spaceChangedMsg.
+// re-issued after each signal so the TUI continuously listens.
+func waitForSignalCmd() tea.Msg {
+	<-signalCh
+	return spaceChangedMsg{}
 }
 
 func focusSpaceCmd(index int) tea.Cmd {
