@@ -131,12 +131,18 @@ func renderDisplayColumn(dg displayGroup, cursorRow int, colWidth int, tmuxPanes
 		maxTitleLen = 10
 	}
 
+	// build session name → panes lookup so space rows can inline tmux detail
+	tmuxBySession := make(map[string][]TmuxPane)
+	for _, p := range tmuxPanes {
+		tmuxBySession[p.SessionName] = append(tmuxBySession[p.SessionName], p)
+	}
+
 	// space rows
 	for i, row := range dg.spaces {
 		relIdx := i + 1
 		absIdx := row.space.Index
 		isSelected := i == cursorRow
-		b.WriteString(renderSpaceRow(row, relIdx, absIdx, isSelected, maxTitleLen, productiveActivity))
+		b.WriteString(renderSpaceRow(row, relIdx, absIdx, isSelected, maxTitleLen, productiveActivity, tmuxBySession))
 		b.WriteString("\n")
 	}
 
@@ -150,17 +156,12 @@ func renderDisplayColumn(dg displayGroup, cursorRow int, colWidth int, tmuxPanes
 	b.WriteString("  ")
 	b.WriteString(fmt.Sprintf("%d terminals", dg.termCount))
 
-	// tmux sessions on this display
-	if len(tmuxPanes) > 0 {
-		b.WriteString(renderTmuxSessions(tmuxPanes, "tmux"))
-	}
-
 	return b.String()
 }
 
 // -- row rendering --
 
-func renderSpaceRow(row spaceRow, relIdx, absIdx int, isSelected bool, maxTitleLen int, productiveActivity map[string]time.Time) string {
+func renderSpaceRow(row spaceRow, relIdx, absIdx int, isSelected bool, maxTitleLen int, productiveActivity map[string]time.Time, tmuxBySession map[string][]TmuxPane) string {
 	cursor := "  "
 	if isSelected {
 		cursor = cursorStyle.Render("> ")
@@ -208,7 +209,66 @@ func renderSpaceRow(row spaceRow, relIdx, absIdx int, isSelected bool, maxTitleL
 
 	windowText := renderWindows(row.windows, maxTitleLen, productiveActivity)
 
-	return fmt.Sprintf("%s%s %s  %s%s", cursor, indexStr, indicator, label, windowText)
+	mainLine := fmt.Sprintf("%s%s %s  %s%s", cursor, indexStr, indicator, label, windowText)
+
+	// inline tmux pane detail under terminals on this space.
+	// matches terminal window titles to tmux session names.
+	// prefix aligns with content after the fixed-width space row prefix:
+	// cursor(2) + index(2) + space(1) + indicator(1) + gap(2) = 8 chars
+	indent := "        "
+	var tmuxLines []string
+	for _, w := range row.windows {
+		if !isTerminal(w.App) {
+			continue
+		}
+		sessionPanes, ok := tmuxBySession[strings.TrimSpace(w.Title)]
+		if !ok {
+			continue
+		}
+		for _, win := range groupPanesByWindow(sessionPanes) {
+			windowLabel := fmt.Sprintf("%d:%s", win.index, win.name)
+
+			// color window label by best productive pane activity
+			var bestProductive time.Time
+			windowHasProductive := false
+			for _, p := range win.panes {
+				if isProductive(p.CurrentCommand) {
+					if !windowHasProductive || p.LastActivity.After(bestProductive) {
+						bestProductive = p.LastActivity
+						windowHasProductive = true
+					}
+				}
+			}
+
+			var line strings.Builder
+			line.WriteString(indent)
+			if windowHasProductive {
+				line.WriteString(stalenessStyle(bestProductive).Render(windowLabel))
+			} else {
+				line.WriteString(dimStyle.Render(windowLabel))
+			}
+
+			// panes inline after window label
+			for _, p := range win.panes {
+				style := dimStyle
+				if isProductive(p.CurrentCommand) {
+					style = stalenessStyle(p.LastActivity)
+				}
+				line.WriteString("  ")
+				line.WriteString(style.Render("\u258e"))
+				line.WriteString(" ")
+				line.WriteString(style.Render(p.CurrentCommand))
+				line.WriteString(" ")
+				line.WriteString(dimStyle.Render(formatRelativeTime(p.LastActivity)))
+			}
+			tmuxLines = append(tmuxLines, line.String())
+		}
+	}
+
+	if len(tmuxLines) > 0 {
+		return mainLine + "\n" + strings.Join(tmuxLines, "\n")
+	}
+	return mainLine
 }
 
 // -- window rendering --
