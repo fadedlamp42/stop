@@ -1,2 +1,7 @@
 # build output
 /stop
+
+# runtime database (like llm-usage/usage.db)
+snapshots.db
+snapshots.db-shm
+snapshots.db-wal

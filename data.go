@@ -94,6 +94,8 @@ type TmuxPane struct {
 	WindowName     string
 	PaneIndex      int
 	CurrentCommand string
+	CurrentPath    string // working directory of the pane's active process
+	PanePID        int    // PID of the pane's active process
 	LastActivity   time.Time
 	HistorySize    int // lines in scroll buffer
 }
@@ -130,7 +132,7 @@ func queryTmuxPanes() []TmuxPane {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	out, err := exec.CommandContext(ctx, "tmux", "list-panes", "-a", "-F",
-		"#{session_name}\t#{window_index}\t#{window_name}\t#{pane_index}\t#{pane_current_command}\t#{window_activity}\t#{history_size}").Output()
+		"#{session_name}\t#{window_index}\t#{window_name}\t#{pane_index}\t#{pane_current_command}\t#{window_activity}\t#{history_size}\t#{pane_current_path}\t#{pane_pid}").Output()
 	if err != nil {
 		return nil
 	}
@@ -140,21 +142,24 @@ func queryTmuxPanes() []TmuxPane {
 			continue
 		}
 		parts := strings.Split(line, "\t")
-		if len(parts) < 7 {
+		if len(parts) < 9 {
 			continue
 		}
-		var windowIndex, paneIndex, historySize int
+		var windowIndex, paneIndex, historySize, panePID int
 		var activityEpoch int64
 		fmt.Sscanf(parts[1], "%d", &windowIndex)
 		fmt.Sscanf(parts[3], "%d", &paneIndex)
 		fmt.Sscanf(parts[5], "%d", &activityEpoch)
 		fmt.Sscanf(parts[6], "%d", &historySize)
+		fmt.Sscanf(parts[8], "%d", &panePID)
 		panes = append(panes, TmuxPane{
 			SessionName:    parts[0],
 			WindowIndex:    windowIndex,
 			WindowName:     parts[2],
 			PaneIndex:      paneIndex,
 			CurrentCommand: parts[4],
+			CurrentPath:    parts[7],
+			PanePID:        panePID,
 			LastActivity:   time.Unix(activityEpoch, 0),
 			HistorySize:    historySize,
 		})

@@ -6,19 +6,42 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"time"
 )
 
-// serveCommand starts an HTTP server that exposes space/tmux data as JSON.
+// serveCommand starts an HTTP server that exposes space/tmux data as JSON,
+// and runs a background snapshot loop that captures system state every 30 seconds.
 func serveCommand(port int) {
+	// initialize snapshot database
+	snapshotDB, err := openSnapshotDB()
+	if err != nil {
+		log.Printf("snapshot db unavailable, running without persistence: %v", err)
+	}
+
+	// start snapshot capture loop in background
+	// session IDs resolved via otop-serve HTTP API (PID matching)
+	if snapshotDB != nil {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		go startSnapshotLoop(ctx, snapshotDB, 30*time.Second)
+	}
+
 	http.HandleFunc("/spaces", handleSpaces)
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("ok"))
 	})
+
+	// query endpoint for historical snapshots
+	if snapshotDB != nil {
+		http.HandleFunc("/snapshots", handleSnapshots(snapshotDB))
+		http.HandleFunc("/snapshots/latest", handleLatestSnapshot(snapshotDB))
+	}
 
 	addr := fmt.Sprintf(":%d", port)
 	fmt.Printf("stop serve on %s\n", addr)
