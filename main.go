@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 )
@@ -16,6 +17,28 @@ func main() {
 		fs.IntVar(port, "p", 8385, "port to listen on")
 		_ = fs.Parse(os.Args[2:])
 		serveCommand(*port)
+		return
+	}
+
+	// `stop history` subcommand — find restarts/crashes/sleeps in the
+	// snapshot timeline and print the last known state before each.
+	if len(os.Args) > 1 && os.Args[1] == "history" {
+		fs := flag.NewFlagSet("history", flag.ExitOnError)
+		since := fs.Duration("since", 7*24*time.Hour, "lookback window (e.g. 24h, 168h)")
+		gap := fs.Duration("gap", 5*time.Minute, "minimum wall-clock gap to flag as a discontinuity")
+		collapse := fs.Int("collapse", 5, "minimum drop in tmux pane count to flag (0 disables)")
+		limit := fs.Int("limit", 1, "max number of discontinuities to print (0 = no limit)")
+		_ = fs.Parse(os.Args[2:])
+		err := historyCommand(historyOptions{
+			since:             time.Now().Add(-*since),
+			gapThreshold:      *gap,
+			collapseThreshold: *collapse,
+			limit:             *limit,
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
 		return
 	}
 

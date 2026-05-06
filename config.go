@@ -21,3 +21,8 @@ var productiveProcesses = map[string]bool{
 func isProductive(command string) bool {
 	return productiveProcesses[command]
 }
+
+// snapshotDBPath is the absolute path where snapshot history is persisted.
+// hardcoded so the binary finds the same db whether it's run from the repo
+// or installed via `go install` (executable-relative paths break that case).
+const snapshotDBPath = "/Users/regular/knowledge/personal/repositories/stop/snapshots.db"

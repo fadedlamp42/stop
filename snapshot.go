@@ -18,7 +18,6 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"path/filepath"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -87,23 +86,12 @@ CREATE INDEX IF NOT EXISTS idx_snapshot_tmux_panes_opencode_session
 	ON snapshot_tmux_panes (opencode_session_id);
 `
 
-// snapshotDBPath returns the path to snapshots.db in the executable's directory,
-// falling back to the current working directory.
-func snapshotDBPath() string {
-	// try executable directory first (matches llm-usage convention of db in repo root)
-	if execPath, err := os.Executable(); err == nil {
-		dir := filepath.Dir(execPath)
-		return filepath.Join(dir, "snapshots.db")
-	}
-	return "snapshots.db"
-}
-
 // openSnapshotDB opens (or creates) the snapshot database and ensures schema exists.
+// path comes from snapshotDBPath in config.go so the install location doesn't matter.
 func openSnapshotDB() (*sql.DB, error) {
-	dbPath := snapshotDBPath()
-	db, err := sql.Open("sqlite", dbPath+"?_journal_mode=WAL&_busy_timeout=5000")
+	db, err := sql.Open("sqlite", snapshotDBPath+"?_journal_mode=WAL&_busy_timeout=5000")
 	if err != nil {
-		return nil, fmt.Errorf("opening snapshot db at %s: %w", dbPath, err)
+		return nil, fmt.Errorf("opening snapshot db at %s: %w", snapshotDBPath, err)
 	}
 
 	// apply schema (IF NOT EXISTS makes this idempotent)
@@ -112,7 +100,7 @@ func openSnapshotDB() (*sql.DB, error) {
 		return nil, fmt.Errorf("applying snapshot schema: %w", err)
 	}
 
-	log.Printf("snapshot db ready at %s", dbPath)
+	log.Printf("snapshot db ready at %s", snapshotDBPath)
 	return db, nil
 }
 
