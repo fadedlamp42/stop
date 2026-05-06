@@ -84,6 +84,22 @@ CREATE INDEX IF NOT EXISTS idx_snapshot_tmux_panes_snapshot_id
 
 CREATE INDEX IF NOT EXISTS idx_snapshot_tmux_panes_opencode_session
 	ON snapshot_tmux_panes (opencode_session_id);
+
+CREATE TABLE IF NOT EXISTS snapshot_nvim_buffers (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	snapshot_id INTEGER NOT NULL REFERENCES snapshots(id),
+	pane_pid INTEGER NOT NULL,
+	buffer_path TEXT NOT NULL,
+	is_current INTEGER NOT NULL,
+	is_modified INTEGER NOT NULL,
+	last_used_ms INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_snapshot_nvim_buffers_snapshot_id
+	ON snapshot_nvim_buffers (snapshot_id);
+
+CREATE INDEX IF NOT EXISTS idx_snapshot_nvim_buffers_pane_pid
+	ON snapshot_nvim_buffers (snapshot_id, pane_pid);
 `
 
 // openSnapshotDB opens (or creates) the snapshot database and ensures schema exists.
@@ -117,6 +133,9 @@ func recordSnapshot(db *sql.DB) error {
 	// that spawned it. walk the process tree to connect them.
 	panePIDToSession := resolveSessionsByAncestry(
 		fetchOtopSessions(), result.tmuxPanes, result.processTree)
+
+	// nvim buffers are already collected as part of fetchAll's second phase.
+	nvimBuffersByPane := result.nvimBuffers
 
 	now := time.Now().UTC().Format(time.RFC3339)
 
@@ -174,6 +193,20 @@ func recordSnapshot(db *sql.DB) error {
 		)
 		if err != nil {
 			return fmt.Errorf("inserting tmux pane: %w", err)
+		}
+	}
+
+	// insert nvim buffers per pane (only panes whose nvim we successfully reached)
+	for panePID, buffers := range nvimBuffersByPane {
+		for _, b := range buffers {
+			_, err := tx.Exec(
+				"INSERT INTO snapshot_nvim_buffers (snapshot_id, pane_pid, buffer_path, is_current, is_modified, last_used_ms) VALUES (?, ?, ?, ?, ?, ?)",
+				snapshotID, panePID, b.Path,
+				boolToInt(b.IsCurrent), boolToInt(b.IsModified), b.LastUsed*1000,
+			)
+			if err != nil {
+				return fmt.Errorf("inserting nvim buffer: %w", err)
+			}
 		}
 	}
 

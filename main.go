@@ -42,6 +42,27 @@ func main() {
 		return
 	}
 
+	// `stop show <snapshot_id>` — render a single snapshot by id (debug aid).
+	if len(os.Args) > 2 && os.Args[1] == "show" {
+		var id int64
+		fmt.Sscanf(os.Args[2], "%d", &id)
+		if id <= 0 {
+			fmt.Fprintln(os.Stderr, "usage: stop show <snapshot_id>")
+			os.Exit(1)
+		}
+		db, err := openSnapshotDB()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
+		defer db.Close()
+		if err := printSnapshotState(os.Stdout, db, id); err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	// default: launch TUI
 	p := tea.NewProgram(newModel(), tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {

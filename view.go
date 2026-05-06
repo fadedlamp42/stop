@@ -70,7 +70,7 @@ func (m model) View() string {
 		if i == m.cursorCol {
 			activeRow = m.cursorRow
 		}
-		col := renderDisplayColumn(dg, activeRow, colWidth, m.tmuxByDisplay[dg.index], productiveActivity)
+		col := renderDisplayColumn(dg, activeRow, colWidth, m.tmuxByDisplay[dg.index], productiveActivity, m.nvimBuffers)
 		styledColumns = append(styledColumns, colStyle.Render(col))
 	}
 
@@ -101,7 +101,7 @@ func (m model) View() string {
 
 	// detached tmux sessions (not attached to any terminal on a display)
 	if len(m.detachedTmux) > 0 {
-		b.WriteString(renderTmuxSessions(m.detachedTmux, "detached"))
+		b.WriteString(renderTmuxSessions(m.detachedTmux, "detached", m.nvimBuffers))
 	}
 
 	// keybinds
@@ -115,7 +115,7 @@ func (m model) View() string {
 
 // -- column rendering --
 
-func renderDisplayColumn(dg displayGroup, cursorRow int, colWidth int, tmuxPanes []TmuxPane, productiveActivity map[string]time.Time) string {
+func renderDisplayColumn(dg displayGroup, cursorRow int, colWidth int, tmuxPanes []TmuxPane, productiveActivity map[string]time.Time, nvimBuffers map[int][]NvimBuffer) string {
 	var b strings.Builder
 
 	// header
@@ -142,7 +142,7 @@ func renderDisplayColumn(dg displayGroup, cursorRow int, colWidth int, tmuxPanes
 		relIdx := i + 1
 		absIdx := row.space.Index
 		isSelected := i == cursorRow
-		b.WriteString(renderSpaceRow(row, relIdx, absIdx, isSelected, maxTitleLen, productiveActivity, tmuxBySession))
+		b.WriteString(renderSpaceRow(row, relIdx, absIdx, isSelected, maxTitleLen, productiveActivity, tmuxBySession, nvimBuffers))
 		b.WriteString("\n")
 	}
 
@@ -161,7 +161,7 @@ func renderDisplayColumn(dg displayGroup, cursorRow int, colWidth int, tmuxPanes
 
 // -- row rendering --
 
-func renderSpaceRow(row spaceRow, relIdx, absIdx int, isSelected bool, maxTitleLen int, productiveActivity map[string]time.Time, tmuxBySession map[string][]TmuxPane) string {
+func renderSpaceRow(row spaceRow, relIdx, absIdx int, isSelected bool, maxTitleLen int, productiveActivity map[string]time.Time, tmuxBySession map[string][]TmuxPane, nvimBuffers map[int][]NvimBuffer) string {
 	cursor := "  "
 	if isSelected {
 		cursor = cursorStyle.Render("> ")
@@ -258,6 +258,12 @@ func renderSpaceRow(row spaceRow, relIdx, absIdx int, isSelected bool, maxTitleL
 				line.WriteString(style.Render("\u258e"))
 				line.WriteString(" ")
 				line.WriteString(style.Render(p.CurrentCommand))
+				if p.CurrentCommand == "nvim" {
+					if extra := nvimBufferLabel(nvimBuffers[p.PanePID]); extra != "" {
+						line.WriteString(" ")
+						line.WriteString(dimStyle.Render(extra))
+					}
+				}
 				line.WriteString(" ")
 				line.WriteString(dimStyle.Render(formatRelativeTime(p.LastActivity)))
 			}
@@ -487,6 +493,47 @@ func formatRelativeTime(t time.Time) string {
 	return fmt.Sprintf("%dd", int(age.Hours()/24))
 }
 
+// nvimBufferLabel renders the active buffer's basename plus a [N] suffix
+// when more than one buffer is open. returns empty string when there's no
+// active buffer (e.g. nvim just launched on a [No Name] scratch).
+func nvimBufferLabel(buffers []NvimBuffer) string {
+	if len(buffers) == 0 {
+		return ""
+	}
+	var active *NvimBuffer
+	for i := range buffers {
+		if buffers[i].IsCurrent {
+			active = &buffers[i]
+			break
+		}
+	}
+	if active == nil {
+		return ""
+	}
+	name := filepathBase(active.Path)
+	if active.IsModified {
+		name += "[+]"
+	}
+	if len(buffers) > 1 {
+		name += fmt.Sprintf(" [%d]", len(buffers))
+	}
+	return name
+}
+
+// filepathBase returns the final path segment, hand-rolled to avoid
+// importing path/filepath just for this one call site.
+func filepathBase(p string) string {
+	if p == "" {
+		return ""
+	}
+	for i := len(p) - 1; i >= 0; i-- {
+		if p[i] == '/' {
+			return p[i+1:]
+		}
+	}
+	return p
+}
+
 // formatHistorySize renders scroll buffer line count compactly
 func formatHistorySize(lines int) string {
 	if lines < 1000 {
@@ -501,7 +548,7 @@ func formatHistorySize(lines int) string {
 // renderTmuxSessions renders tmux panes grouped by session with staleness
 // coloring, scroll buffer sizes, and time since last activity.
 // header is the section label (e.g. "tmux" or "detached").
-func renderTmuxSessions(panes []TmuxPane, header string) string {
+func renderTmuxSessions(panes []TmuxPane, header string, nvimBuffers map[int][]NvimBuffer) string {
 	if len(panes) == 0 {
 		return ""
 	}
@@ -549,6 +596,12 @@ func renderTmuxSessions(panes []TmuxPane, header string) string {
 				b.WriteString(style.Render("\u258e"))
 				b.WriteString(" ")
 				b.WriteString(style.Render(p.CurrentCommand))
+				if p.CurrentCommand == "nvim" {
+					if extra := nvimBufferLabel(nvimBuffers[p.PanePID]); extra != "" {
+						b.WriteString(" ")
+						b.WriteString(dimStyle.Render(extra))
+					}
+				}
 				b.WriteString(" ")
 				b.WriteString(dimStyle.Render(timeStr))
 			}

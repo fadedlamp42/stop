@@ -234,12 +234,13 @@ func focusSpace(index int) {
 
 // fetchResult holds the combined result of all concurrent queries
 type fetchResult struct {
-	spaces      []Space
-	windows     []Window
-	tmuxPanes   []TmuxPane
-	tmuxClients []TmuxClient
-	processTree map[int]int
-	err         error
+	spaces       []Space
+	windows      []Window
+	tmuxPanes    []TmuxPane
+	tmuxClients  []TmuxClient
+	processTree  map[int]int
+	nvimBuffers  map[int][]NvimBuffer // pane_pid → buffers (only for nvim panes)
+	err          error
 }
 
 // fetchAll queries yabai (spaces + windows) and tmux concurrently.
@@ -304,11 +305,18 @@ func fetchAll() fetchResult {
 	if spaceErr != nil {
 		return fetchResult{err: spaceErr}
 	}
+
+	// nvim introspection runs after the first phase since it needs both
+	// tmuxPanes (to filter) and processTree (to map nvim → pane). queries
+	// inside collectNvimBuffers are themselves parallel per nvim instance.
+	nvimBuffers := collectNvimBuffers(tmuxPanes, processTree)
+
 	return fetchResult{
 		spaces:      spaces,
 		windows:     windows,
 		tmuxPanes:   tmuxPanes,
 		tmuxClients: tmuxClients,
 		processTree: processTree,
+		nvimBuffers: nvimBuffers,
 	}
 }

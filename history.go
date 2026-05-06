@@ -225,10 +225,18 @@ func printSpacesAndWindows(w io.Writer, db *sql.DB, snapshotID int64) error {
 }
 
 // printTmuxInventory groups all tmux panes by session → window and prints
-// command, working dir, and resolved opencode session id per pane.
+// command, working dir, and resolved opencode session id per pane. nvim
+// panes additionally show their open buffer list (if introspection succeeded
+// at capture time).
 func printTmuxInventory(w io.Writer, db *sql.DB, snapshotID int64) error {
+	// preload all nvim buffers for this snapshot, keyed by pane_pid
+	buffersByPane, err := loadNvimBuffersForSnapshot(db, snapshotID)
+	if err != nil {
+		return err
+	}
+
 	prows, err := db.Query(
-		"SELECT session_name, window_index, window_name, pane_index, current_command, current_path, opencode_session_id FROM snapshot_tmux_panes WHERE snapshot_id = ? ORDER BY session_name, window_index, pane_index",
+		"SELECT session_name, window_index, window_name, pane_index, current_command, current_path, pane_pid, opencode_session_id FROM snapshot_tmux_panes WHERE snapshot_id = ? ORDER BY session_name, window_index, pane_index",
 		snapshotID,
 	)
 	if err != nil {
@@ -238,6 +246,7 @@ func printTmuxInventory(w io.Writer, db *sql.DB, snapshotID int64) error {
 
 	type pane struct {
 		command, path, opencodeID string
+		panePID                   int
 	}
 	type windowGroup struct {
 		index int
@@ -253,9 +262,9 @@ func printTmuxInventory(w io.Writer, db *sql.DB, snapshotID int64) error {
 	sessions := map[string]*sessionGroup{}
 	for prows.Next() {
 		var sessionName, windowName, command, path string
-		var windowIdx, paneIdx int
+		var windowIdx, paneIdx, panePID int
 		var oid sql.NullString
-		if err := prows.Scan(&sessionName, &windowIdx, &windowName, &paneIdx, &command, &path, &oid); err != nil {
+		if err := prows.Scan(&sessionName, &windowIdx, &windowName, &paneIdx, &command, &path, &panePID, &oid); err != nil {
 			continue
 		}
 
@@ -282,7 +291,7 @@ func printTmuxInventory(w io.Writer, db *sql.DB, snapshotID int64) error {
 		if oid.Valid {
 			opencodeID = oid.String
 		}
-		wg.panes = append(wg.panes, pane{command: command, path: path, opencodeID: opencodeID})
+		wg.panes = append(wg.panes, pane{command: command, path: path, opencodeID: opencodeID, panePID: panePID})
 	}
 
 	if len(sessionOrder) == 0 {
@@ -306,10 +315,53 @@ func printTmuxInventory(w io.Writer, db *sql.DB, snapshotID int64) error {
 					suffix = "  " + p.opencodeID
 				}
 				fmt.Fprintf(w, "        %-12s  %s%s\n", p.command, shortPath(p.path), suffix)
+				for _, b := range buffersByPane[p.panePID] {
+					marker := " "
+					if b.IsCurrent {
+						marker = "*"
+					}
+					mod := ""
+					if b.IsModified {
+						mod = " [+]"
+					}
+					fmt.Fprintf(w, "          %s %s%s\n", marker, shortPath(b.Path), mod)
+				}
 			}
 		}
 	}
 	return nil
+}
+
+// loadNvimBuffersForSnapshot returns nvim buffers grouped by pane_pid for a
+// given snapshot. current buffer is sorted first so the active file is
+// immediately visible in the rendered output.
+func loadNvimBuffersForSnapshot(db *sql.DB, snapshotID int64) (map[int][]NvimBuffer, error) {
+	rows, err := db.Query(
+		"SELECT pane_pid, buffer_path, is_current, is_modified, last_used_ms FROM snapshot_nvim_buffers WHERE snapshot_id = ? ORDER BY pane_pid, is_current DESC, last_used_ms DESC",
+		snapshotID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("querying nvim buffers: %w", err)
+	}
+	defer rows.Close()
+
+	out := map[int][]NvimBuffer{}
+	for rows.Next() {
+		var panePID int
+		var path string
+		var isCurrent, isModified int
+		var lastUsedMs int64
+		if err := rows.Scan(&panePID, &path, &isCurrent, &isModified, &lastUsedMs); err != nil {
+			continue
+		}
+		out[panePID] = append(out[panePID], NvimBuffer{
+			Path:       path,
+			IsCurrent:  isCurrent == 1,
+			IsModified: isModified == 1,
+			LastUsed:   lastUsedMs / 1000,
+		})
+	}
+	return out, rows.Err()
 }
 
 // formatTime renders a UTC timestamp with the user's local time alongside.

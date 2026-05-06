@@ -60,6 +60,7 @@ type model struct {
 	tmuxPanes   []TmuxPane
 	tmuxClients []TmuxClient
 	processTree map[int]int
+	nvimBuffers map[int][]NvimBuffer // pane_pid → open buffers
 
 	// derived (rebuilt on each data refresh)
 	displayGroups []displayGroup
@@ -162,6 +163,7 @@ func (m model) handleData(result fetchResult) (tea.Model, tea.Cmd) {
 	m.tmuxPanes = result.tmuxPanes
 	m.tmuxClients = result.tmuxClients
 	m.processTree = result.processTree
+	m.nvimBuffers = result.nvimBuffers
 	m.err = nil
 	m.ready = true
 	m.displayGroups = buildDisplayGroups(m.spaces, m.windows)
