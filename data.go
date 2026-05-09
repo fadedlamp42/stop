@@ -240,6 +240,8 @@ type fetchResult struct {
 	tmuxClients  []TmuxClient
 	processTree  map[int]int
 	nvimBuffers  map[int][]NvimBuffer // pane_pid → buffers (only for nvim panes)
+	nvimWindows  []NvimWindow         // flat list, each tagged with PanePID/NvimPID
+	nvimSessions []NvimSession        // one per reachable nvim instance
 	err          error
 }
 
@@ -308,15 +310,18 @@ func fetchAll() fetchResult {
 
 	// nvim introspection runs after the first phase since it needs both
 	// tmuxPanes (to filter) and processTree (to map nvim → pane). queries
-	// inside collectNvimBuffers are themselves parallel per nvim instance.
-	nvimBuffers := collectNvimBuffers(tmuxPanes, processTree)
+	// inside collectNvimState are themselves parallel per nvim instance
+	// and one round-trip pulls buffers + windows + session state.
+	capture := collectNvimState(tmuxPanes, processTree)
 
 	return fetchResult{
-		spaces:      spaces,
-		windows:     windows,
-		tmuxPanes:   tmuxPanes,
-		tmuxClients: tmuxClients,
-		processTree: processTree,
-		nvimBuffers: nvimBuffers,
+		spaces:       spaces,
+		windows:      windows,
+		tmuxPanes:    tmuxPanes,
+		tmuxClients:  tmuxClients,
+		processTree:  processTree,
+		nvimBuffers:  capture.PerPaneBuffers,
+		nvimWindows:  capture.Windows,
+		nvimSessions: capture.Sessions,
 	}
 }

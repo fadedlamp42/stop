@@ -18,6 +18,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -89,10 +90,18 @@ CREATE TABLE IF NOT EXISTS snapshot_nvim_buffers (
 	id INTEGER PRIMARY KEY AUTOINCREMENT,
 	snapshot_id INTEGER NOT NULL REFERENCES snapshots(id),
 	pane_pid INTEGER NOT NULL,
+	nvim_pid INTEGER NOT NULL DEFAULT 0,
 	buffer_path TEXT NOT NULL,
 	is_current INTEGER NOT NULL,
 	is_modified INTEGER NOT NULL,
-	last_used_ms INTEGER NOT NULL DEFAULT 0
+	last_used_ms INTEGER NOT NULL DEFAULT 0,
+	cursor_line INTEGER NOT NULL DEFAULT 0,
+	line_count INTEGER NOT NULL DEFAULT 0,
+	filetype TEXT NOT NULL DEFAULT '',
+	changedtick INTEGER NOT NULL DEFAULT 0,
+	gitsigns_added INTEGER NOT NULL DEFAULT 0,
+	gitsigns_changed INTEGER NOT NULL DEFAULT 0,
+	gitsigns_removed INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_snapshot_nvim_buffers_snapshot_id
@@ -100,7 +109,87 @@ CREATE INDEX IF NOT EXISTS idx_snapshot_nvim_buffers_snapshot_id
 
 CREATE INDEX IF NOT EXISTS idx_snapshot_nvim_buffers_pane_pid
 	ON snapshot_nvim_buffers (snapshot_id, pane_pid);
+
+CREATE TABLE IF NOT EXISTS snapshot_nvim_windows (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	snapshot_id INTEGER NOT NULL REFERENCES snapshots(id),
+	pane_pid INTEGER NOT NULL,
+	nvim_pid INTEGER NOT NULL,
+	win_id INTEGER NOT NULL,
+	tab_nr INTEGER NOT NULL,
+	win_nr INTEGER NOT NULL,
+	bufnr INTEGER NOT NULL,
+	width INTEGER NOT NULL,
+	height INTEGER NOT NULL,
+	topline INTEGER NOT NULL,
+	botline INTEGER NOT NULL,
+	cursor_line INTEGER NOT NULL,
+	cursor_col INTEGER NOT NULL,
+	is_quickfix INTEGER NOT NULL,
+	is_loclist INTEGER NOT NULL,
+	is_terminal INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_snapshot_nvim_windows_snapshot_id
+	ON snapshot_nvim_windows (snapshot_id);
+
+CREATE INDEX IF NOT EXISTS idx_snapshot_nvim_windows_pane_pid
+	ON snapshot_nvim_windows (snapshot_id, pane_pid);
+
+CREATE TABLE IF NOT EXISTS snapshot_nvim_sessions (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	snapshot_id INTEGER NOT NULL REFERENCES snapshots(id),
+	pane_pid INTEGER NOT NULL,
+	nvim_pid INTEGER NOT NULL,
+	cwd TEXT NOT NULL DEFAULT '',
+	servername TEXT NOT NULL DEFAULT '',
+	nvim_version TEXT NOT NULL DEFAULT '',
+	argv_json TEXT NOT NULL DEFAULT '[]',
+	cmd_history_json TEXT NOT NULL DEFAULT '[]',
+	search_register TEXT NOT NULL DEFAULT '',
+	jumplist_json TEXT NOT NULL DEFAULT '[]',
+	quickfix_size INTEGER NOT NULL DEFAULT 0,
+	loclist_size INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_snapshot_nvim_sessions_snapshot_id
+	ON snapshot_nvim_sessions (snapshot_id);
+
+CREATE INDEX IF NOT EXISTS idx_snapshot_nvim_sessions_pane_pid
+	ON snapshot_nvim_sessions (snapshot_id, pane_pid);
 `
+
+// nvimBufferUpgrades lists columns added to snapshot_nvim_buffers after
+// its initial release. fresh databases get them via the CREATE TABLE
+// above; existing dbs need ALTER TABLE ADD COLUMN. SQLite has no
+// "IF NOT EXISTS" for ADD COLUMN so we tolerate the duplicate-column
+// error per call.
+var nvimBufferUpgrades = []struct{ name, decl string }{
+	{"nvim_pid", "INTEGER NOT NULL DEFAULT 0"},
+	{"cursor_line", "INTEGER NOT NULL DEFAULT 0"},
+	{"line_count", "INTEGER NOT NULL DEFAULT 0"},
+	{"filetype", "TEXT NOT NULL DEFAULT ''"},
+	{"changedtick", "INTEGER NOT NULL DEFAULT 0"},
+	{"gitsigns_added", "INTEGER NOT NULL DEFAULT 0"},
+	{"gitsigns_changed", "INTEGER NOT NULL DEFAULT 0"},
+	{"gitsigns_removed", "INTEGER NOT NULL DEFAULT 0"},
+}
+
+// migrateSnapshotDB applies additive column upgrades to tables that
+// shipped earlier without them. each ALTER is independent and idempotent
+// via duplicate-column tolerance.
+func migrateSnapshotDB(db *sql.DB) error {
+	for _, c := range nvimBufferUpgrades {
+		stmt := fmt.Sprintf("ALTER TABLE snapshot_nvim_buffers ADD COLUMN %s %s", c.name, c.decl)
+		if _, err := db.Exec(stmt); err != nil {
+			if strings.Contains(err.Error(), "duplicate column") {
+				continue
+			}
+			return fmt.Errorf("migrating snapshot_nvim_buffers.%s: %w", c.name, err)
+		}
+	}
+	return nil
+}
 
 // openSnapshotDB opens (or creates) the snapshot database and ensures schema exists.
 // path comes from snapshotDBPath in config.go so the install location doesn't matter.
@@ -114,6 +203,12 @@ func openSnapshotDB() (*sql.DB, error) {
 	if _, err := db.Exec(snapshotSchema); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("applying snapshot schema: %w", err)
+	}
+
+	// run additive column migrations for tables that shipped earlier.
+	if err := migrateSnapshotDB(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrating snapshot db: %w", err)
 	}
 
 	log.Printf("snapshot db ready at %s", snapshotDBPath)
@@ -134,8 +229,11 @@ func recordSnapshot(db *sql.DB) error {
 	panePIDToSession := resolveSessionsByAncestry(
 		fetchOtopSessions(), result.tmuxPanes, result.processTree)
 
-	// nvim buffers are already collected as part of fetchAll's second phase.
+	// nvim state (buffers + windows + sessions) is already collected as
+	// part of fetchAll's second phase.
 	nvimBuffersByPane := result.nvimBuffers
+	nvimWindows := result.nvimWindows
+	nvimSessions := result.nvimSessions
 
 	now := time.Now().UTC().Format(time.RFC3339)
 
@@ -200,13 +298,46 @@ func recordSnapshot(db *sql.DB) error {
 	for panePID, buffers := range nvimBuffersByPane {
 		for _, b := range buffers {
 			_, err := tx.Exec(
-				"INSERT INTO snapshot_nvim_buffers (snapshot_id, pane_pid, buffer_path, is_current, is_modified, last_used_ms) VALUES (?, ?, ?, ?, ?, ?)",
-				snapshotID, panePID, b.Path,
+				"INSERT INTO snapshot_nvim_buffers (snapshot_id, pane_pid, nvim_pid, buffer_path, is_current, is_modified, last_used_ms, cursor_line, line_count, filetype, changedtick, gitsigns_added, gitsigns_changed, gitsigns_removed) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+				snapshotID, panePID, b.NvimPID, b.Path,
 				boolToInt(b.IsCurrent), boolToInt(b.IsModified), b.LastUsed*1000,
+				b.CursorLine, b.LineCount, b.Filetype, b.ChangedTick,
+				b.GitsignsAdded, b.GitsignsChanged, b.GitsignsRemoved,
 			)
 			if err != nil {
 				return fmt.Errorf("inserting nvim buffer: %w", err)
 			}
+		}
+	}
+
+	// insert nvim windows (one row per visible split across all reached nvims)
+	for _, w := range nvimWindows {
+		_, err := tx.Exec(
+			"INSERT INTO snapshot_nvim_windows (snapshot_id, pane_pid, nvim_pid, win_id, tab_nr, win_nr, bufnr, width, height, topline, botline, cursor_line, cursor_col, is_quickfix, is_loclist, is_terminal) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+			snapshotID, w.PanePID, w.NvimPID, w.WinID, w.TabNr, w.WinNr, w.BufNr,
+			w.Width, w.Height, w.TopLine, w.BotLine, w.CursorLine, w.CursorCol,
+			boolToInt(w.IsQuickfix), boolToInt(w.IsLoclist), boolToInt(w.IsTerminal),
+		)
+		if err != nil {
+			return fmt.Errorf("inserting nvim window: %w", err)
+		}
+	}
+
+	// insert nvim sessions (one row per reached nvim instance). list-shaped
+	// fields are persisted as JSON so they round-trip without a schema change
+	// when their semantics evolve.
+	for _, s := range nvimSessions {
+		argvJSON, _ := json.Marshal(s.Argv)
+		cmdJSON, _ := json.Marshal(s.CmdHistory)
+		jumpJSON, _ := json.Marshal(s.Jumplist)
+		_, err := tx.Exec(
+			"INSERT INTO snapshot_nvim_sessions (snapshot_id, pane_pid, nvim_pid, cwd, servername, nvim_version, argv_json, cmd_history_json, search_register, jumplist_json, quickfix_size, loclist_size) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+			snapshotID, s.PanePID, s.NvimPID, s.Cwd, s.Servername, s.NvimVersion,
+			string(argvJSON), string(cmdJSON), s.Search, string(jumpJSON),
+			s.QuickfixSize, s.LoclistSize,
+		)
+		if err != nil {
+			return fmt.Errorf("inserting nvim session: %w", err)
 		}
 	}
 

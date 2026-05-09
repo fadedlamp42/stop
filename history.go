@@ -337,7 +337,7 @@ func printTmuxInventory(w io.Writer, db *sql.DB, snapshotID int64) error {
 // immediately visible in the rendered output.
 func loadNvimBuffersForSnapshot(db *sql.DB, snapshotID int64) (map[int][]NvimBuffer, error) {
 	rows, err := db.Query(
-		"SELECT pane_pid, buffer_path, is_current, is_modified, last_used_ms FROM snapshot_nvim_buffers WHERE snapshot_id = ? ORDER BY pane_pid, is_current DESC, last_used_ms DESC",
+		"SELECT pane_pid, nvim_pid, buffer_path, is_current, is_modified, last_used_ms, cursor_line, line_count, filetype, changedtick, gitsigns_added, gitsigns_changed, gitsigns_removed FROM snapshot_nvim_buffers WHERE snapshot_id = ? ORDER BY pane_pid, is_current DESC, last_used_ms DESC",
 		snapshotID,
 	)
 	if err != nil {
@@ -347,19 +347,20 @@ func loadNvimBuffersForSnapshot(db *sql.DB, snapshotID int64) (map[int][]NvimBuf
 
 	out := map[int][]NvimBuffer{}
 	for rows.Next() {
-		var panePID int
-		var path string
+		var b NvimBuffer
 		var isCurrent, isModified int
 		var lastUsedMs int64
-		if err := rows.Scan(&panePID, &path, &isCurrent, &isModified, &lastUsedMs); err != nil {
+		if err := rows.Scan(
+			&b.PanePID, &b.NvimPID, &b.Path, &isCurrent, &isModified, &lastUsedMs,
+			&b.CursorLine, &b.LineCount, &b.Filetype, &b.ChangedTick,
+			&b.GitsignsAdded, &b.GitsignsChanged, &b.GitsignsRemoved,
+		); err != nil {
 			continue
 		}
-		out[panePID] = append(out[panePID], NvimBuffer{
-			Path:       path,
-			IsCurrent:  isCurrent == 1,
-			IsModified: isModified == 1,
-			LastUsed:   lastUsedMs / 1000,
-		})
+		b.IsCurrent = isCurrent == 1
+		b.IsModified = isModified == 1
+		b.LastUsed = lastUsedMs / 1000
+		out[b.PanePID] = append(out[b.PanePID], b)
 	}
 	return out, rows.Err()
 }
