@@ -5,7 +5,7 @@ module.exports = {
   apps: [
     {
       name: "stop-serve",
-      script: "./stop",
+      script: "stop",
       args: "serve -p 8391",
       cwd: __dirname,
       interpreter: "none",
