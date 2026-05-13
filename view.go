@@ -104,6 +104,15 @@ func (m model) View() string {
 		b.WriteString(renderTmuxSessions(m.detachedTmux, "detached", m.nvimBuffers))
 	}
 
+	// now playing (when spotify is running)
+	if m.nowPlaying != "" {
+		b.WriteString("\n")
+		b.WriteString(pad)
+		b.WriteString(dimStyle.Render("\u266a "))
+		b.WriteString(dimStyle.Render(m.nowPlaying))
+		b.WriteString("\n")
+	}
+
 	// keybinds
 	b.WriteString("\n")
 	b.WriteString(pad)

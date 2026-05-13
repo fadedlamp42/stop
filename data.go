@@ -11,11 +11,38 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 )
+
+// queryNowPlaying runs ~/scripts/playing and returns its single-line output.
+// returns "" when the script is missing, fails, or reports nothing playing
+// ("NONE"). short timeout — never block a tick on a slow music probe.
+func queryNowPlaying() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	script := filepath.Join(home, "scripts", "playing")
+	if _, err := os.Stat(script); err != nil {
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, script).Output()
+	if err != nil {
+		return ""
+	}
+	line := strings.TrimSpace(string(out))
+	if line == "" || line == "NONE" {
+		return ""
+	}
+	return line
+}
 
 // terminal emulator app names as reported by macOS / yabai
 var terminalApps = map[string]bool{
@@ -242,6 +269,7 @@ type fetchResult struct {
 	nvimBuffers  map[int][]NvimBuffer // pane_pid → buffers (only for nvim panes)
 	nvimWindows  []NvimWindow         // flat list, each tagged with PanePID/NvimPID
 	nvimSessions []NvimSession        // one per reachable nvim instance
+	nowPlaying   string               // current spotify track or "PAUSED"; "" when nothing
 	err          error
 }
 
@@ -259,7 +287,17 @@ func fetchAll() fetchResult {
 		wg          sync.WaitGroup
 	)
 
-	wg.Add(5)
+	var nowPlaying string
+
+	wg.Add(6)
+
+	go func() {
+		defer wg.Done()
+		np := queryNowPlaying()
+		mu.Lock()
+		nowPlaying = np
+		mu.Unlock()
+	}()
 
 	go func() {
 		defer wg.Done()
@@ -323,5 +361,6 @@ func fetchAll() fetchResult {
 		nvimBuffers:  capture.PerPaneBuffers,
 		nvimWindows:  capture.Windows,
 		nvimSessions: capture.Sessions,
+		nowPlaying:   nowPlaying,
 	}
 }

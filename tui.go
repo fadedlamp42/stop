@@ -61,6 +61,7 @@ type model struct {
 	tmuxClients []TmuxClient
 	processTree map[int]int
 	nvimBuffers map[int][]NvimBuffer // pane_pid → open buffers
+	nowPlaying  string               // current spotify track, "PAUSED", or ""
 
 	// derived (rebuilt on each data refresh)
 	displayGroups []displayGroup
@@ -164,6 +165,7 @@ func (m model) handleData(result fetchResult) (tea.Model, tea.Cmd) {
 	m.tmuxClients = result.tmuxClients
 	m.processTree = result.processTree
 	m.nvimBuffers = result.nvimBuffers
+	m.nowPlaying = result.nowPlaying
 	m.err = nil
 	m.ready = true
 	m.displayGroups = buildDisplayGroups(m.spaces, m.windows)
