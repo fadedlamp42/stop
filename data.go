@@ -14,34 +14,132 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
 
-// queryNowPlaying runs ~/scripts/playing and returns its single-line output.
-// returns "" when the script is missing, fails, or reports nothing playing
-// ("NONE"). short timeout — never block a tick on a slow music probe.
-func queryNowPlaying() string {
+// (queryNowPlaying removed: PlayingMeta carries artist/title now, so the
+// `playing meta` call replaces `playing` + `playing position` entirely.)
+
+// PlayingMeta captures a single sample of the player state. SampledAt is
+// set at the time we received the data so consumers can interpolate the
+// position forward between samples using wall-clock time, instead of
+// paying the script's ~50ms latency on every render.
+//
+// State is "playing" / "paused" / "" (unknown / nothing). Position and
+// Duration are seconds (floats); for a paused track Position stays fixed,
+// for a playing track we interpolate Position += (now - SampledAt). when
+// Duration <= 0 the consumer can't compute a fraction and should treat
+// the play head as unknown.
+//
+// Artist and Title come from the same script call, so one osascript
+// dispatch covers everything the renderer + lyrics fetcher need.
+type PlayingMeta struct {
+	State     string
+	Position  float64
+	Duration  float64
+	Artist    string
+	Title     string
+	SampledAt time.Time
+}
+
+// queryPlayingMeta runs ~/scripts/playing meta and parses the
+// tab-separated "state\tposition\tduration\tartist\ttitle" output.
+// returns a zero meta (with empty State) when nothing is playing or the
+// script is unavailable. SampledAt is stamped right after the read so
+// interpolation tracks real wall-clock elapsed time from the read point,
+// not the request point.
+func queryPlayingMeta() PlayingMeta {
+	out, ok := runPlaying("meta")
+	if !ok {
+		return PlayingMeta{}
+	}
+	line := strings.TrimRight(string(out), "\n\r")
+	if line == "" {
+		return PlayingMeta{}
+	}
+	parts := strings.Split(line, "\t")
+	if len(parts) < 3 {
+		return PlayingMeta{}
+	}
+	pos, errP := strconv.ParseFloat(parts[1], 64)
+	dur, errD := strconv.ParseFloat(parts[2], 64)
+	if errP != nil || errD != nil {
+		return PlayingMeta{}
+	}
+	meta := PlayingMeta{
+		State:     parts[0],
+		Position:  pos,
+		Duration:  dur,
+		SampledAt: time.Now(),
+	}
+	if len(parts) >= 5 {
+		meta.Artist = parts[3]
+		meta.Title = parts[4]
+	}
+	return meta
+}
+
+// DisplayString renders the meta for the UI's now-playing line. matches
+// the legacy /scripts/playing output: empty when nothing, "PAUSED" when
+// paused, "ARTIST - TITLE" when playing.
+func (m PlayingMeta) DisplayString() string {
+	if m.State == "" {
+		return ""
+	}
+	if m.State == "paused" {
+		return "PAUSED"
+	}
+	if m.Artist == "" && m.Title == "" {
+		return ""
+	}
+	return m.Artist + " - " + m.Title
+}
+
+// CurrentFraction interpolates the fraction 0.0-1.0 of the song's elapsed
+// position at wall-clock time `now`. for a playing track it advances the
+// last sampled position by (now - SampledAt); for paused it holds steady.
+// returns -1 when the meta is empty or duration is unknown, which the
+// renderer treats as "no play head" and suppresses the active-line marker.
+func (m PlayingMeta) CurrentFraction(now time.Time) float64 {
+	if m.Duration <= 0 || m.State == "" {
+		return -1
+	}
+	pos := m.Position
+	if m.State == "playing" {
+		pos += now.Sub(m.SampledAt).Seconds()
+	}
+	if pos < 0 {
+		pos = 0
+	}
+	frac := pos / m.Duration
+	if frac > 1 {
+		frac = 1
+	}
+	return frac
+}
+
+// runPlaying invokes ~/scripts/playing with the given args. centralized so
+// path resolution and timeout policy live in one place. returns (output,
+// ok) where ok=false means the script was missing or failed.
+func runPlaying(args ...string) ([]byte, bool) {
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return ""
+		return nil, false
 	}
 	script := filepath.Join(home, "scripts", "playing")
 	if _, err := os.Stat(script); err != nil {
-		return ""
+		return nil, false
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, script).Output()
+	out, err := exec.CommandContext(ctx, script, args...).Output()
 	if err != nil {
-		return ""
+		return nil, false
 	}
-	line := strings.TrimSpace(string(out))
-	if line == "" || line == "NONE" {
-		return ""
-	}
-	return line
+	return out, true
 }
 
 // terminal emulator app names as reported by macOS / yabai
@@ -269,8 +367,8 @@ type fetchResult struct {
 	nvimBuffers  map[int][]NvimBuffer // pane_pid → buffers (only for nvim panes)
 	nvimWindows  []NvimWindow         // flat list, each tagged with PanePID/NvimPID
 	nvimSessions []NvimSession        // one per reachable nvim instance
-	nowPlaying   string               // current spotify track or "PAUSED"; "" when nothing
-	err          error
+	playingMeta PlayingMeta // single sample of player state used for both UI + interpolation
+	err         error
 }
 
 // fetchAll queries yabai (spaces + windows) and tmux concurrently.
@@ -287,15 +385,15 @@ func fetchAll() fetchResult {
 		wg          sync.WaitGroup
 	)
 
-	var nowPlaying string
+	var playingMeta PlayingMeta
 
 	wg.Add(6)
 
 	go func() {
 		defer wg.Done()
-		np := queryNowPlaying()
+		m := queryPlayingMeta()
 		mu.Lock()
-		nowPlaying = np
+		playingMeta = m
 		mu.Unlock()
 	}()
 
@@ -361,6 +459,6 @@ func fetchAll() fetchResult {
 		nvimBuffers:  capture.PerPaneBuffers,
 		nvimWindows:  capture.Windows,
 		nvimSessions: capture.Sessions,
-		nowPlaying:   nowPlaying,
+		playingMeta:  playingMeta,
 	}
 }

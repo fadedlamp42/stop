@@ -25,6 +25,19 @@ import (
 type dataMsg fetchResult
 type tickMsg time.Time
 
+// metaMsg carries a fresh PlayingMeta sample from the dedicated 500ms
+// meta-sampling goroutine. cheap relative to fetchAll (single script call,
+// no yabai/tmux queries). between metaMsgs the renderer interpolates the
+// position locally so visual scrolling stays smooth even though the actual
+// player state isn't being polled every frame.
+type metaMsg PlayingMeta
+
+// renderTickMsg fires every ~100ms purely to trigger a re-render. it
+// carries no payload — the View() function recomputes the interpolated
+// position from m.playingMeta + wall-clock at draw time, so the lyrics
+// scroll smoothly without paying the cost of an extra script call.
+type renderTickMsg struct{}
+
 // spaceChangedMsg is sent when yabai reports a space/display focus change via SIGUSR1
 type spaceChangedMsg struct{}
 
@@ -61,7 +74,7 @@ type model struct {
 	tmuxClients []TmuxClient
 	processTree map[int]int
 	nvimBuffers map[int][]NvimBuffer // pane_pid → open buffers
-	nowPlaying  string               // current spotify track, "PAUSED", or ""
+	playingMeta PlayingMeta          // latest player sample; renderer interpolates from this
 
 	// derived (rebuilt on each data refresh)
 	displayGroups []displayGroup
@@ -83,7 +96,7 @@ func newModel() model {
 }
 
 func (m model) Init() tea.Cmd {
-	return tea.Batch(fetchCmd, tickCmd(), waitForSignalCmd)
+	return tea.Batch(fetchCmd, tickCmd(), metaSampleCmd(), renderTickCmd(), waitForSignalCmd)
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -96,6 +109,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case dataMsg:
 		return m.handleData(fetchResult(msg))
+	case metaMsg:
+		m.playingMeta = PlayingMeta(msg)
+		if artist, title := parseNowPlaying(m.playingMeta.DisplayString()); artist != "" {
+			ensureLyricsFetch(artist, title)
+		}
+		return m, metaSampleCmd()
+	case renderTickMsg:
+		// no state change, just trigger a re-render so the interpolated
+		// position recomputes against the latest wall-clock.
+		return m, renderTickCmd()
 	case tickMsg:
 		return m, tea.Batch(fetchCmd, tickCmd())
 	case spaceChangedMsg:
@@ -165,7 +188,14 @@ func (m model) handleData(result fetchResult) (tea.Model, tea.Cmd) {
 	m.tmuxClients = result.tmuxClients
 	m.processTree = result.processTree
 	m.nvimBuffers = result.nvimBuffers
-	m.nowPlaying = result.nowPlaying
+	m.playingMeta = result.playingMeta
+
+	// kick off lyrics fetch when a song is known. cached per artist|title,
+	// so re-issuing on every tick is cheap once the song's been resolved.
+	if artist, title := parseNowPlaying(m.playingMeta.DisplayString()); artist != "" {
+		ensureLyricsFetch(artist, title)
+	}
+
 	m.err = nil
 	m.ready = true
 	m.displayGroups = buildDisplayGroups(m.spaces, m.windows)
@@ -373,6 +403,27 @@ func fetchCmd() tea.Msg {
 func tickCmd() tea.Cmd {
 	return tea.Tick(2*time.Second, func(t time.Time) tea.Msg {
 		return tickMsg(t)
+	})
+}
+
+// metaSampleCmd schedules a fresh PlayingMeta sample in 500ms. one
+// osascript call resolves state + position + duration + artist + title,
+// so this is the only shell work that runs between full fetchAll ticks.
+// the renderer interpolates the position between these samples using
+// wall-clock time, which lets the visible scroll stay smooth at 100ms
+// render cadence without the cost of a script call every frame.
+func metaSampleCmd() tea.Cmd {
+	return tea.Tick(500*time.Millisecond, func(t time.Time) tea.Msg {
+		return metaMsg(queryPlayingMeta())
+	})
+}
+
+// renderTickCmd fires every 100ms purely to nudge bubbletea into calling
+// View() again so the interpolated play head advances smoothly. zero work
+// in the callback itself — all the actual computation happens in View().
+func renderTickCmd() tea.Cmd {
+	return tea.Tick(100*time.Millisecond, func(t time.Time) tea.Msg {
+		return renderTickMsg{}
 	})
 }
 

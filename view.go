@@ -17,18 +17,22 @@ import (
 	"time"
 
 	"github.com/charmbracelet/lipgloss"
+	"github.com/mattn/go-runewidth"
 )
 
 // -- styles --
 
 var (
-	displayStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("6")).Bold(true)
-	dimStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
-	cursorStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("6"))
-	freeStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("2"))
-	warnStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("3"))
-	keyStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("15"))
-	helpStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+	displayStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("6")).Bold(true)
+	dimStyle         = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+	cursorStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("6"))
+	freeStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("2"))
+	warnStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("3"))
+	keyStyle         = lipgloss.NewStyle().Foreground(lipgloss.Color("15"))
+	helpStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+	lyricActiveStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("15")).Bold(true)
+	lyricNearStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("7"))
+	lyricFarStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
 )
 
 // -- view --
@@ -90,36 +94,62 @@ func (m model) View() string {
 		body = lipgloss.JoinHorizontal(lipgloss.Top, args...)
 	}
 
-	var b strings.Builder
-	b.WriteString("\n")
 	pad := strings.Repeat(" ", margin)
+
+	// build the page in three slabs:
+	//   top    = spaces grid + detached tmux + now-playing line
+	//   middle = lyrics viewport (claims all remaining terminal height)
+	//   bottom = keybinds help
+	// computing lengths up front lets the lyrics block expand or shrink
+	// to fill exactly the leftover vertical space.
+
+	var top strings.Builder
+	top.WriteString("\n")
 	for _, line := range strings.Split(body, "\n") {
-		b.WriteString(pad)
-		b.WriteString(line)
-		b.WriteString("\n")
+		top.WriteString(pad)
+		top.WriteString(line)
+		top.WriteString("\n")
 	}
 
-	// detached tmux sessions (not attached to any terminal on a display)
 	if len(m.detachedTmux) > 0 {
-		b.WriteString(renderTmuxSessions(m.detachedTmux, "detached", m.nvimBuffers))
+		top.WriteString(renderTmuxSessions(m.detachedTmux, "detached", m.nvimBuffers))
 	}
 
-	// now playing (when spotify is running)
-	if m.nowPlaying != "" {
-		b.WriteString("\n")
-		b.WriteString(pad)
-		b.WriteString(dimStyle.Render("\u266a "))
-		b.WriteString(dimStyle.Render(m.nowPlaying))
-		b.WriteString("\n")
+	nowPlayingDisplay := m.playingMeta.DisplayString()
+	if nowPlayingDisplay != "" {
+		top.WriteString("\n")
+		top.WriteString(pad)
+		top.WriteString(dimStyle.Render("\u266a "))
+		top.WriteString(dimStyle.Render(nowPlayingDisplay))
+		top.WriteString("\n")
 	}
 
-	// keybinds
-	b.WriteString("\n")
-	b.WriteString(pad)
-	b.WriteString(renderHelp(numDisplays > 1))
-	b.WriteString("\n")
+	bottom := "\n" + pad + renderHelp(numDisplays > 1) + "\n"
 
-	return b.String()
+	topStr := top.String()
+
+	// only render the lyrics viewport once we know a song is playing and
+	// we have data (or are actively fetching it). avoids a permanent
+	// empty band at the bottom of the screen when nothing is playing.
+	artist, title := m.playingMeta.Artist, m.playingMeta.Title
+	lyricsBlock := ""
+	if artist != "" && title != "" {
+		used := countLines(topStr) + countLines(bottom)
+		// leave one breathing-room line above the lyrics block
+		remaining := m.height - used - 1
+		if remaining >= 3 {
+			positionFrac := m.playingMeta.CurrentFraction(time.Now())
+			lyricsBlock = "\n" + renderLyricsViewport(artist, title, positionFrac, m.width-2*margin, remaining, pad)
+		}
+	}
+
+	return topStr + lyricsBlock + bottom
+}
+
+// countLines returns the number of '\n' separators in s. used to budget
+// remaining vertical space for the lyrics viewport.
+func countLines(s string) int {
+	return strings.Count(s, "\n")
 }
 
 // -- column rendering --
@@ -618,4 +648,267 @@ func renderTmuxSessions(panes []TmuxPane, header string, nvimBuffers map[int][]N
 		}
 	}
 	return b.String()
+}
+
+// -- lyrics viewport --
+
+// renderLyricsViewport paints a full-width, height-fixed block of lyrics
+// for the currently-playing song. when synced LRC data is available, the
+// active line is held centered and surrounding lines fade with distance
+// from the play head. positionFrac is a 0.0-1.0 seek decimal; -1 means
+// the play head is unknown (renders from the song start).
+//
+// the function always returns exactly `height` newline-separated lines so
+// the layout above and below stays stable as the viewport refreshes.
+func renderLyricsViewport(artist, title string, positionFrac float64, width, height int, pad string) string {
+	lyrics := getCachedLyrics(artist, title)
+
+	label := " lyrics "
+	if lyrics != nil && lyrics.Found && lyrics.Source != "" {
+		label = " lyrics \u00b7 " + lyrics.Source + " "
+	}
+	header := dimStyle.Render("\u2500"+label) +
+		dimStyle.Render(strings.Repeat("\u2500", maxInt(0, width-len(label)-1)))
+	lines := []string{pad + header}
+
+	bodyHeight := height - 1
+	if bodyHeight < 1 {
+		return padToHeight(lines, height, pad)
+	}
+
+	if lyrics == nil {
+		if lyricsFetchInFlight(artist, title) {
+			lines = append(lines, pad+dimStyle.Render("loading lyrics..."))
+		}
+		return padToHeight(lines, height, pad)
+	}
+	if !lyrics.Found {
+		// chain tried all providers (lrclib + netease + qqmusic); none had
+		// a match. message intentionally generic — naming any specific
+		// provider would be misleading.
+		lines = append(lines, pad+dimStyle.Render("no lyrics found"))
+		return padToHeight(lines, height, pad)
+	}
+
+	// synced path — each LRC line expands into 1-3 visual rows:
+	//   row 1: original text, left-aligned (with "> " marker on active LRC)
+	//   row 2: romaji, right-aligned, when present
+	//   row 3: english translation, right-aligned, when present
+	// the viewport selects a window of visual rows centered on the active
+	// LRC's first row. all rows belonging to the active LRC share the
+	// active highlight so the eye snaps to the whole block at once.
+	if len(lyrics.Synced) > 0 {
+		havePosition := positionFrac >= 0
+		songLen := lyrics.Duration
+		if songLen == 0 {
+			for _, l := range lyrics.Synced {
+				if l.At > songLen {
+					songLen = l.At
+				}
+			}
+		}
+
+		active := -1
+		if havePosition && songLen > 0 {
+			frac := positionFrac
+			if frac > 1.0 {
+				frac = 1.0
+			}
+			elapsed := time.Duration(float64(songLen) * frac)
+			active = activeLineIndex(lyrics.Synced, elapsed)
+		}
+
+		visual := flattenSynced(lyrics.Synced)
+
+		// find the visual index of the active LRC's first (text) row.
+		// used to center the active block in the viewport.
+		activeVisual := -1
+		if active >= 0 {
+			for vi, v := range visual {
+				if v.srcIdx == active && v.kind == lyricKindText {
+					activeVisual = vi
+					break
+				}
+			}
+		}
+
+		half := bodyHeight / 2
+		start := 0
+		if activeVisual >= 0 {
+			start = activeVisual - half
+			if start < 0 {
+				start = 0
+			}
+		}
+		end := start + bodyHeight
+		if end > len(visual) {
+			end = len(visual)
+			start = end - bodyHeight
+			if start < 0 {
+				start = 0
+			}
+		}
+
+		for vi := start; vi < end; vi++ {
+			v := visual[vi]
+			styled := renderLyricVisualRow(v, active, havePosition, width)
+			lines = append(lines, pad+styled)
+		}
+		return padToHeight(lines, height, pad)
+	}
+
+	// plain text fallback — no scroll, just show whatever fits from the top.
+	plainLines := strings.Split(lyrics.Plain, "\n")
+	for i := 0; i < bodyHeight && i < len(plainLines); i++ {
+		lines = append(lines, pad+lyricFarStyle.Render(truncateStr(plainLines[i], width-2)))
+	}
+	return padToHeight(lines, height, pad)
+}
+
+// padToHeight pads a list of rendered lines with blank rows so the
+// resulting string has exactly `height` newline-terminated lines. keeps
+// the rest of the TUI from jumping when the lyrics block has fewer
+// lines than the available viewport.
+func padToHeight(lines []string, height int, pad string) string {
+	for len(lines) < height {
+		lines = append(lines, pad)
+	}
+	if len(lines) > height {
+		lines = lines[:height]
+	}
+	return strings.Join(lines, "\n") + "\n"
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+// -- visual-row expansion for synced lyrics --
+
+// lyricRowKind tags each visual row with what part of an LRC entry it
+// represents. drives alignment + style picks downstream.
+type lyricRowKind int
+
+const (
+	lyricKindText lyricRowKind = iota
+	lyricKindRomaji
+	lyricKindTranslation
+)
+
+// lyricVisualRow is one rendered line within the lyrics viewport. each
+// source LRC entry expands into 1-3 of these depending on which optional
+// fields are populated.
+type lyricVisualRow struct {
+	srcIdx int
+	kind   lyricRowKind
+	text   string
+}
+
+// flattenSynced expands an LRC stream into the per-visual-row stream the
+// viewport consumes. blank text entries get a middle dot so they still
+// occupy a row (intentional silence/instrumental beats in the LRC remain
+// visible). romaji + translation rows only appear when populated.
+func flattenSynced(synced []LRCLine) []lyricVisualRow {
+	rows := make([]lyricVisualRow, 0, len(synced))
+	for i, l := range synced {
+		text := l.Text
+		if text == "" {
+			text = "\u00b7"
+		}
+		rows = append(rows, lyricVisualRow{srcIdx: i, kind: lyricKindText, text: text})
+		if l.Romaji != "" {
+			rows = append(rows, lyricVisualRow{srcIdx: i, kind: lyricKindRomaji, text: l.Romaji})
+		}
+		if l.Translation != "" {
+			rows = append(rows, lyricVisualRow{srcIdx: i, kind: lyricKindTranslation, text: l.Translation})
+		}
+	}
+	return rows
+}
+
+// renderLyricVisualRow paints one row from the expanded stream into the
+// styled string the viewport joins. left-aligns text rows (with marker)
+// and right-aligns romaji / translation rows. style cascades from the
+// LRC index's distance to the active line so the whole 1-3 row block of
+// the active LRC stays uniformly highlighted.
+func renderLyricVisualRow(v lyricVisualRow, activeIdx int, havePosition bool, width int) string {
+	style := pickLyricStyle(v.srcIdx, activeIdx, havePosition)
+
+	// available content width after the 2-char left gutter (the gutter
+	// holds either "> " for the active text row or "  " padding for
+	// alignment with the marker column).
+	inner := width - 2
+	if inner < 4 {
+		inner = 4
+	}
+
+	switch v.kind {
+	case lyricKindText:
+		gutter := "  "
+		if havePosition && v.srcIdx == activeIdx {
+			gutter = "> "
+		}
+		body := truncateForWidth(v.text, inner)
+		return style.Render(gutter + body)
+	default: // romaji or translation — right-aligned, no marker
+		body := truncateForWidth(v.text, inner)
+		bodyWidth := runewidth.StringWidth(body)
+		padCount := inner - bodyWidth
+		if padCount < 0 {
+			padCount = 0
+		}
+		return style.Render("  " + strings.Repeat(" ", padCount) + body)
+	}
+}
+
+// pickLyricStyle returns the style to use for a row belonging to LRC
+// index srcIdx, given the currently active line. when no position is
+// known we use the near style uniformly so nothing reads as "active".
+func pickLyricStyle(srcIdx, activeIdx int, havePosition bool) lipgloss.Style {
+	if !havePosition || activeIdx < 0 {
+		return lyricNearStyle
+	}
+	if srcIdx == activeIdx {
+		return lyricActiveStyle
+	}
+	distance := srcIdx - activeIdx
+	if distance < 0 {
+		distance = -distance
+	}
+	if distance <= 2 {
+		return lyricNearStyle
+	}
+	return lyricFarStyle
+}
+
+// truncateForWidth trims s so its on-screen width (per east-asian
+// wide-char rules) fits within `width` cells, appending an ellipsis when
+// truncation occurred. uses runewidth so CJK and other wide chars are
+// counted accurately.
+func truncateForWidth(s string, width int) string {
+	if width < 2 {
+		width = 2
+	}
+	if runewidth.StringWidth(s) <= width {
+		return s
+	}
+	const ellipsis = "..."
+	target := width - len(ellipsis)
+	if target < 1 {
+		return s[:1]
+	}
+	var b strings.Builder
+	consumed := 0
+	for _, r := range s {
+		w := runewidth.RuneWidth(r)
+		if consumed+w > target {
+			break
+		}
+		b.WriteRune(r)
+		consumed += w
+	}
+	return b.String() + ellipsis
 }
