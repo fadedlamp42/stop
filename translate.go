@@ -20,8 +20,98 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
+
+// -- title translation cache --
+//
+// the now-playing strip shows "ARTIST - TITLE" raw; when either field
+// contains non-latin script we kick off a background google-translate
+// call and (when it returns) render the english version on a second line
+// below. cached per (artist|title) string for the process lifetime so
+// switching between known songs costs no API round-trips.
+//
+// the entry's Done flag distinguishes "translation finished, here's
+// nothing" (already english, or google returned empty) from "not yet
+// fetched, show nothing yet" — without a Done flag the renderer can't
+// tell which case it's in.
+
+type titleTransEntry struct {
+	Translation string
+	Done        bool
+}
+
+var (
+	titleTransMu       sync.Mutex
+	titleTransByKey    = make(map[string]titleTransEntry)
+	titleTransInFlight = make(map[string]bool)
+)
+
+// getCachedTitleTranslation returns the english translation cached for
+// (artist, title). returns "" when the translation is still pending OR
+// when no translation is needed (latin source). callers should not
+// distinguish between these — both render as "no extra line".
+func getCachedTitleTranslation(artist, title string) string {
+	if artist == "" && title == "" {
+		return ""
+	}
+	titleTransMu.Lock()
+	defer titleTransMu.Unlock()
+	return titleTransByKey[artist+"|"+title].Translation
+}
+
+// ensureTitleTranslation kicks off a background translation when the
+// title or artist contains non-latin text and we haven't already
+// translated this pair. caches both positive and negative results so
+// we don't re-hit google every render.
+func ensureTitleTranslation(artist, title string) {
+	if artist == "" && title == "" {
+		return
+	}
+	// translate artist + " - " + title as one string so google sees them
+	// in context (proper-noun person names romanize correctly only with
+	// context — translating "式浦躁吾" alone gives mandarin pinyin
+	// "Shipu Zaowu" instead of japanese "Shikiura Zago"). the literal
+	// " - " separator survives the translation pipeline so we can render
+	// the result with the dash preserved between fields.
+	combined := strings.TrimSpace(artist + " - " + title)
+	if combined == "" {
+		return
+	}
+	if latinShare(combined) >= 0.85 {
+		return
+	}
+
+	key := artist + "|" + title
+	titleTransMu.Lock()
+	if entry, ok := titleTransByKey[key]; ok && entry.Done {
+		titleTransMu.Unlock()
+		return
+	}
+	if titleTransInFlight[key] {
+		titleTransMu.Unlock()
+		return
+	}
+	titleTransInFlight[key] = true
+	titleTransMu.Unlock()
+
+	go func() {
+		result := translateBatch([]string{combined})
+
+		titleTransMu.Lock()
+		defer titleTransMu.Unlock()
+		delete(titleTransInFlight, key)
+		entry := titleTransEntry{Done: true}
+		if len(result) > 0 {
+			t := strings.TrimSpace(result[0])
+			if t != "" && !strings.EqualFold(t, combined) {
+				entry.Translation = t
+			}
+		}
+		titleTransByKey[key] = entry
+	}()
+}
 
 // translateBatch translates a slice of lines from auto-detected source to
 // english in a single HTTP call. preserves order and length: result[i]

@@ -117,11 +117,40 @@ func (m model) View() string {
 
 	nowPlayingDisplay := m.playingMeta.DisplayString()
 	if nowPlayingDisplay != "" {
+		// inner width available for the now-playing strip after the
+		// "♪ " glyph + space prefix (2 cells). wrap both the raw display
+		// and any translation to this width so long artist/title combos
+		// flow to additional lines instead of being clipped at the
+		// terminal edge (and we don't ellipsize — the user wants every
+		// character preserved).
+		npInner := m.width - 2*margin - 2
+		if npInner < 8 {
+			npInner = 8
+		}
+
+		writeWrapped := func(prefix, body string) {
+			lines := wrapForWidth(body, npInner)
+			for i, line := range lines {
+				top.WriteString(pad)
+				if i == 0 {
+					top.WriteString(dimStyle.Render(prefix))
+				} else {
+					top.WriteString(dimStyle.Render("  "))
+				}
+				top.WriteString(dimStyle.Render(line))
+				top.WriteString("\n")
+			}
+		}
+
 		top.WriteString("\n")
-		top.WriteString(pad)
-		top.WriteString(dimStyle.Render("\u266a "))
-		top.WriteString(dimStyle.Render(nowPlayingDisplay))
-		top.WriteString("\n")
+		writeWrapped("\u266a ", nowPlayingDisplay)
+		// english translation of the artist + title when the source is
+		// non-latin. populated asynchronously after a song change so the
+		// row only appears once translateBatch returns. wrapped to the
+		// same inner width as the original line.
+		if trans := getCachedTitleTranslation(m.playingMeta.Artist, m.playingMeta.Title); trans != "" {
+			writeWrapped("  ", trans)
+		}
 	}
 
 	bottom := "\n" + pad + renderHelp(numDisplays > 1) + "\n"

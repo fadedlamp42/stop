@@ -481,15 +481,22 @@ func artistsRoughlyMatch(a, b string) bool {
 	return na == nb || strings.Contains(na, nb) || strings.Contains(nb, na)
 }
 
-// titlesRoughlyMatch compares two track titles. asian providers often
-// list romanizations or translated names alongside the original, so we
-// also allow a substring match in either direction.
+// titlesRoughlyMatch compares two track titles. accepts exact normalized
+// equality or a strict-prefix relationship in either direction. prefix
+// covers the common "extended title" cases ("Bohemian Rhapsody" vs
+// "Bohemian Rhapsody (Remastered 2011)", "群青" vs "群青 - THE FIRST
+// TAKE") without accepting accidental substring overlaps that would
+// match unrelated songs (e.g. "Terminal" being a suffix of "my
+// terminal" — different songs that happen to share a word).
 func titlesRoughlyMatch(a, b string) bool {
 	na, nb := normalizeTitle(a), normalizeTitle(b)
 	if na == "" || nb == "" {
 		return false
 	}
-	return na == nb || strings.Contains(na, nb) || strings.Contains(nb, na)
+	if na == nb {
+		return true
+	}
+	return strings.HasPrefix(na, nb) || strings.HasPrefix(nb, na)
 }
 
 var (

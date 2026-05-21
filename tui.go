@@ -113,6 +113,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.playingMeta = PlayingMeta(msg)
 		if artist, title := parseNowPlaying(m.playingMeta.DisplayString()); artist != "" {
 			ensureLyricsFetch(artist, title)
+			ensureTitleTranslation(artist, title)
 		}
 		return m, metaSampleCmd()
 	case renderTickMsg:
@@ -190,10 +191,12 @@ func (m model) handleData(result fetchResult) (tea.Model, tea.Cmd) {
 	m.nvimBuffers = result.nvimBuffers
 	m.playingMeta = result.playingMeta
 
-	// kick off lyrics fetch when a song is known. cached per artist|title,
-	// so re-issuing on every tick is cheap once the song's been resolved.
+	// kick off lyrics fetch + title translation when a song is known.
+	// both are cached per artist|title, so re-issuing on every tick is
+	// cheap once the song's been resolved.
 	if artist, title := parseNowPlaying(m.playingMeta.DisplayString()); artist != "" {
 		ensureLyricsFetch(artist, title)
+		ensureTitleTranslation(artist, title)
 	}
 
 	m.err = nil
