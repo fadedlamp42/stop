@@ -180,8 +180,10 @@ func fetchLyrics(artist, title string) *Lyrics {
 		}
 		hit.Source = p.name
 		hit.QueryKey = result.QueryKey
+		dropBlankLines(hit)
 		annotateRomaji(hit)
 		annotateTranslations(hit)
+		insertGapMarkers(hit)
 		return hit
 	}
 	return result
@@ -230,6 +232,101 @@ func applyTranslationLRC(l *Lyrics, rawLRC string) {
 			ti++
 		}
 	}
+}
+
+// dropBlankLines removes synced entries whose text is empty after trim.
+// LRC files commonly include bare `[mm:ss.xx]` stamps as "clear display"
+// markers between lyrics. our gap-marker insertion handles instrumental
+// indication on its own, and the next non-blank entry's timestamp already
+// communicates "previous line is no longer active", so blanks add nothing.
+// dropping them BEFORE gap-marker insertion also gives the gap detector
+// a clean view of inter-vocal silences.
+func dropBlankLines(l *Lyrics) {
+	if l == nil {
+		return
+	}
+	out := l.Synced[:0]
+	for _, line := range l.Synced {
+		if strings.TrimSpace(line.Text) == "" {
+			continue
+		}
+		out = append(out, line)
+	}
+	l.Synced = out
+}
+
+// -- instrumental gap markers --
+
+// gapMarkerText is the literal text used for synthetic between-lyric
+// rows. picked so the renderer can distinguish gap markers from real
+// lyrics via a simple `Text == gapMarkerText` check (a struct flag
+// would be cleaner but this avoids touching LRCLine consumers that
+// already iterate lyrics.Synced).
+const gapMarkerText = "\u266a"
+
+// minLyricGap is the smallest silence that earns a gap marker. shorter
+// gaps don't need one — the next line is on its way and an empty
+// viewport for a second or two reads as breathing space rather than as
+// "did the playback stall?".
+const minLyricGap = 8 * time.Second
+
+// insertGapMarkers walks the synced lines and inserts a synthetic
+// instrumental marker (\u266a) at any gap longer than minLyricGap. uses
+// the existing LRCLine type so the marker participates in active-line
+// detection and viewport scrolling without any special-casing elsewhere.
+//
+// covers three gap classes: intro (before the first lyric), inter-line
+// (between two lyrics), and outro (after the last lyric up to the song
+// end). the outro case requires lyrics.Duration to be known — without
+// a real song length we can't tell where the song actually ends, so we
+// skip outro markers when duration is zero.
+//
+// inter-line markers fire at the GAP MIDPOINT so the previous lyric
+// retains the first half of the silence as its "active" window. LRC
+// timestamps only mark when a line begins; the vocal can trail on for
+// several seconds after, and using a small post-line lead would force
+// the marker to preempt the line while its vocal was still playing.
+// midpoint gives each side a fair share of the gap and keeps sync
+// matching what the listener actually hears.
+func insertGapMarkers(l *Lyrics) {
+	if l == nil || len(l.Synced) == 0 {
+		return
+	}
+
+	out := make([]LRCLine, 0, len(l.Synced)+8)
+
+	// intro gap: when the first lyric starts well after t=0, fill the
+	// runway with a marker that's active for the whole pre-vocal stretch.
+	if l.Synced[0].At >= minLyricGap {
+		out = append(out, LRCLine{At: 0, Text: gapMarkerText})
+	}
+
+	for i, line := range l.Synced {
+		out = append(out, line)
+
+		var nextAt time.Duration
+		if i+1 < len(l.Synced) {
+			nextAt = l.Synced[i+1].At
+		} else if l.Duration > 0 {
+			nextAt = l.Duration
+		} else {
+			continue // can't compute gap to song end
+		}
+		gap := nextAt - line.At
+		if gap < minLyricGap {
+			continue
+		}
+
+		// midpoint placement: prev line stays active for the first half
+		// (covers vocal trail/held notes), marker takes over for the
+		// clearly-instrumental second half.
+		out = append(out, LRCLine{
+			At:   line.At + gap/2,
+			Text: gapMarkerText,
+		})
+	}
+
+	l.Synced = out
 }
 
 // annotateTranslations fills in Translation with English for every line

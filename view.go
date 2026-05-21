@@ -708,29 +708,69 @@ func renderLyricsViewport(artist, title string, positionFrac float64, width, hei
 			}
 		}
 
+		// active drives the bold/highlight cascade; scrollAnchor drives the
+		// viewport's vertical centering. they're usually the same, but
+		// diverge in two cases worth handling:
+		//   1. position is known but before the first lyric — active stays
+		//      -1 (no entry has actually fired), scrollAnchor points at
+		//      the upcoming line so the viewport drifts towards it instead
+		//      of sitting frozen at the top
+		//   2. position unknown — both stay -1, viewport sits at top
 		active := -1
+		scrollAnchor := -1
+		var elapsed time.Duration
 		if havePosition && songLen > 0 {
 			frac := positionFrac
 			if frac > 1.0 {
 				frac = 1.0
 			}
-			elapsed := time.Duration(float64(songLen) * frac)
+			elapsed = time.Duration(float64(songLen) * frac)
 			active = activeLineIndex(lyrics.Synced, elapsed)
+			scrollAnchor = active
+			if scrollAnchor < 0 {
+				// no LRC line has fired yet — anchor to the upcoming one so
+				// the viewport reflects progress through the pre-vocal
+				// runway. fall back to position-fraction estimate when
+				// even the upcoming line is past the end of the LRC array.
+				for i := range lyrics.Synced {
+					if lyrics.Synced[i].At > elapsed {
+						scrollAnchor = i
+						break
+					}
+				}
+				if scrollAnchor < 0 && len(lyrics.Synced) > 0 {
+					est := int(frac * float64(len(lyrics.Synced)))
+					if est >= len(lyrics.Synced) {
+						est = len(lyrics.Synced) - 1
+					}
+					scrollAnchor = est
+				}
+			}
 		}
 
 		visual := flattenSynced(lyrics.Synced)
 
-		// find the visual index of the active LRC's first (text) row.
-		// used to center the active block in the viewport.
+		// find the visual index of the scroll anchor's first (text) row.
+		// used to center the viewport. when scrollAnchor differs from
+		// active (pre-vocal case), no row gets the active bold treatment
+		// but the viewport still drifts towards the upcoming entry.
 		activeVisual := -1
-		if active >= 0 {
+		if scrollAnchor >= 0 {
 			for vi, v := range visual {
-				if v.srcIdx == active && v.kind == lyricKindText {
+				if v.srcIdx == scrollAnchor && v.kind == lyricKindText {
 					activeVisual = vi
 					break
 				}
 			}
 		}
+
+		// when the active entry is a synthetic gap marker, render every
+		// other row in far-style. the default near-style cascade (lines
+		// within 2 of active) would lift the surrounding lyrics into a
+		// semi-highlighted state and make the upcoming line look like it
+		// shared focus with the ♪ marker — confusing during an
+		// instrumental where the marker should be the only emphasized row.
+		activeIsMarker := active >= 0 && lyrics.Synced[active].Text == gapMarkerText
 
 		half := bodyHeight / 2
 		start := 0
@@ -751,7 +791,7 @@ func renderLyricsViewport(artist, title string, positionFrac float64, width, hei
 
 		for vi := start; vi < end; vi++ {
 			v := visual[vi]
-			styled := renderLyricVisualRow(v, active, havePosition, width)
+			styled := renderLyricVisualRow(v, active, havePosition, activeIsMarker, width)
 			lines = append(lines, pad+styled)
 		}
 		return padToHeight(lines, height, pad)
@@ -808,17 +848,16 @@ type lyricVisualRow struct {
 }
 
 // flattenSynced expands an LRC stream into the per-visual-row stream the
-// viewport consumes. blank text entries get a middle dot so they still
-// occupy a row (intentional silence/instrumental beats in the LRC remain
-// visible). romaji + translation rows only appear when populated.
+// viewport consumes. blank-text entries are dropped upstream by
+// dropBlankLines so every entry here contributes at least one row (the
+// original text); romaji + translation rows only appear when populated.
 func flattenSynced(synced []LRCLine) []lyricVisualRow {
 	rows := make([]lyricVisualRow, 0, len(synced))
 	for i, l := range synced {
-		text := l.Text
-		if text == "" {
-			text = "\u00b7"
+		if l.Text == "" {
+			continue // defensive: should be stripped by dropBlankLines already
 		}
-		rows = append(rows, lyricVisualRow{srcIdx: i, kind: lyricKindText, text: text})
+		rows = append(rows, lyricVisualRow{srcIdx: i, kind: lyricKindText, text: l.Text})
 		if l.Romaji != "" {
 			rows = append(rows, lyricVisualRow{srcIdx: i, kind: lyricKindRomaji, text: l.Romaji})
 		}
@@ -833,9 +872,11 @@ func flattenSynced(synced []LRCLine) []lyricVisualRow {
 // styled string the viewport joins. left-aligns text rows (with marker)
 // and right-aligns romaji / translation rows. style cascades from the
 // LRC index's distance to the active line so the whole 1-3 row block of
-// the active LRC stays uniformly highlighted.
-func renderLyricVisualRow(v lyricVisualRow, activeIdx int, havePosition bool, width int) string {
-	style := pickLyricStyle(v.srcIdx, activeIdx, havePosition)
+// the active LRC stays uniformly highlighted. activeIsMarker tells the
+// style picker to suppress the near-style cascade so a music-note gap
+// marker doesn't visually drag the adjacent lyric into its focus.
+func renderLyricVisualRow(v lyricVisualRow, activeIdx int, havePosition, activeIsMarker bool, width int) string {
+	style := pickLyricStyle(v.srcIdx, activeIdx, havePosition, activeIsMarker)
 
 	// available content width after the 2-char left gutter (the gutter
 	// holds either "> " for the active text row or "  " padding for
@@ -847,6 +888,18 @@ func renderLyricVisualRow(v lyricVisualRow, activeIdx int, havePosition bool, wi
 
 	switch v.kind {
 	case lyricKindText:
+		// gap markers — synthetic ♪ between lyrics — render center-aligned
+		// without the "> " marker so they read as filler rather than as
+		// cryptic single-char lyrics. active styling still applies so the
+		// user knows the play head is sitting in the instrumental.
+		if v.text == gapMarkerText {
+			body := v.text
+			pad := (inner - runewidth.StringWidth(body)) / 2
+			if pad < 0 {
+				pad = 0
+			}
+			return style.Render("  " + strings.Repeat(" ", pad) + body)
+		}
 		gutter := "  "
 		if havePosition && v.srcIdx == activeIdx {
 			gutter = "> "
@@ -867,12 +920,17 @@ func renderLyricVisualRow(v lyricVisualRow, activeIdx int, havePosition bool, wi
 // pickLyricStyle returns the style to use for a row belonging to LRC
 // index srcIdx, given the currently active line. when no position is
 // known we use the near style uniformly so nothing reads as "active".
-func pickLyricStyle(srcIdx, activeIdx int, havePosition bool) lipgloss.Style {
+// when activeIsMarker is true (instrumental ♪ playing), every non-active
+// row drops to far-style so the marker is the only emphasized row.
+func pickLyricStyle(srcIdx, activeIdx int, havePosition, activeIsMarker bool) lipgloss.Style {
 	if !havePosition || activeIdx < 0 {
 		return lyricNearStyle
 	}
 	if srcIdx == activeIdx {
 		return lyricActiveStyle
+	}
+	if activeIsMarker {
+		return lyricFarStyle
 	}
 	distance := srcIdx - activeIdx
 	if distance < 0 {

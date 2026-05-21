@@ -34,8 +34,14 @@ func TestLyricsLiveProviders(t *testing.T) {
 		if len(hit.Synced) > 0 {
 			tailLRC = formatLRCTimestamp(hit.Synced[len(hit.Synced)-1].At)
 		}
-		fmt.Printf("[%-7s] %s - %s   synced=%d plain=%d dur=%s last_lrc=%s\n",
-			hit.Source, c.artist, c.title, len(hit.Synced), len(hit.Plain),
+		markers := 0
+		for _, ln := range hit.Synced {
+			if ln.Text == gapMarkerText {
+				markers++
+			}
+		}
+		fmt.Printf("[%-7s] %s - %s   synced=%d (gap-markers=%d) plain=%d dur=%s last_lrc=%s\n",
+			hit.Source, c.artist, c.title, len(hit.Synced), markers, len(hit.Plain),
 			hit.Duration.Round(1e9), tailLRC)
 		// preview the first few non-trivial lines so we can eyeball
 		// romanization + translation quality at a glance.
