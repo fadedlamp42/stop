@@ -797,10 +797,53 @@ func renderLyricsViewport(artist, title string, positionFrac float64, width, hei
 		return padToHeight(lines, height, pad)
 	}
 
-	// plain text fallback — no scroll, just show whatever fits from the top.
+	// plain text fallback — no per-line timestamps to sync against, so we
+	// estimate the active line as `positionFrac * lineCount` and center
+	// the viewport on it. without a play head we'd sit frozen at the top
+	// for the whole song; with the estimate at least the window drifts
+	// in time with playback. no "> " marker is rendered (the estimate is
+	// approximate by definition), and the estimated row gets a slightly
+	// emphasized style to hint at "where you probably are".
 	plainLines := strings.Split(lyrics.Plain, "\n")
-	for i := 0; i < bodyHeight && i < len(plainLines); i++ {
-		lines = append(lines, pad+lyricFarStyle.Render(truncateStr(plainLines[i], width-2)))
+	total := len(plainLines)
+	estIdx := -1
+	if positionFrac >= 0 && total > 0 {
+		frac := positionFrac
+		if frac < 0 {
+			frac = 0
+		}
+		if frac > 1 {
+			frac = 1
+		}
+		estIdx = int(frac * float64(total))
+		if estIdx >= total {
+			estIdx = total - 1
+		}
+	}
+	half := bodyHeight / 2
+	start := 0
+	if estIdx >= 0 {
+		start = estIdx - half
+		if start < 0 {
+			start = 0
+		}
+	}
+	end := start + bodyHeight
+	if end > total {
+		end = total
+		start = end - bodyHeight
+		if start < 0 {
+			start = 0
+		}
+	}
+	for i := start; i < end; i++ {
+		style := lyricFarStyle
+		if i == estIdx {
+			// no bold, no marker — just a small emphasis so the user can
+			// spot where the estimate is sitting within the window.
+			style = lyricNearStyle
+		}
+		lines = append(lines, pad+style.Render("  "+truncateForWidth(plainLines[i], width-2)))
 	}
 	return padToHeight(lines, height, pad)
 }
