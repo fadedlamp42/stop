@@ -710,12 +710,17 @@ func renderLyricsViewport(artist, title string, positionFrac float64, width, hei
 
 		// active drives the bold/highlight cascade; scrollAnchor drives the
 		// viewport's vertical centering. they're usually the same, but
-		// diverge in two cases worth handling:
+		// diverge in three cases worth handling:
 		//   1. position is known but before the first lyric — active stays
 		//      -1 (no entry has actually fired), scrollAnchor points at
 		//      the upcoming line so the viewport drifts towards it instead
 		//      of sitting frozen at the top
 		//   2. position unknown — both stay -1, viewport sits at top
+		//   3. timestamps are synthetic (provider returned plain text only,
+		//      we faked the syncs) — active forced to -1 so no row gets
+		//      highlighted, scrollAnchor uses the position-fraction
+		//      estimate directly. this matches the "estimate, don't
+		//      assert" promise we made for approximate sync.
 		active := -1
 		scrollAnchor := -1
 		var elapsed time.Duration
@@ -725,25 +730,35 @@ func renderLyricsViewport(artist, title string, positionFrac float64, width, hei
 				frac = 1.0
 			}
 			elapsed = time.Duration(float64(songLen) * frac)
-			active = activeLineIndex(lyrics.Synced, elapsed)
-			scrollAnchor = active
-			if scrollAnchor < 0 {
-				// no LRC line has fired yet — anchor to the upcoming one so
-				// the viewport reflects progress through the pre-vocal
-				// runway. fall back to position-fraction estimate when
-				// even the upcoming line is past the end of the LRC array.
-				for i := range lyrics.Synced {
-					if lyrics.Synced[i].At > elapsed {
-						scrollAnchor = i
-						break
-					}
-				}
-				if scrollAnchor < 0 && len(lyrics.Synced) > 0 {
+			if lyrics.SyncedIsApproximate {
+				// approximate sync — never highlight an "active" line;
+				// scroll purely from the position fraction.
+				if len(lyrics.Synced) > 0 {
 					est := int(frac * float64(len(lyrics.Synced)))
 					if est >= len(lyrics.Synced) {
 						est = len(lyrics.Synced) - 1
 					}
 					scrollAnchor = est
+				}
+			} else {
+				active = activeLineIndex(lyrics.Synced, elapsed)
+				scrollAnchor = active
+				if scrollAnchor < 0 {
+					// no LRC line has fired yet — anchor to the upcoming
+					// one so the viewport drifts toward it.
+					for i := range lyrics.Synced {
+						if lyrics.Synced[i].At > elapsed {
+							scrollAnchor = i
+							break
+						}
+					}
+					if scrollAnchor < 0 && len(lyrics.Synced) > 0 {
+						est := int(frac * float64(len(lyrics.Synced)))
+						if est >= len(lyrics.Synced) {
+							est = len(lyrics.Synced) - 1
+						}
+						scrollAnchor = est
+					}
 				}
 			}
 		}

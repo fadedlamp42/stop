@@ -52,13 +52,17 @@ type LRCLine struct {
 // position fraction into an absolute elapsed time. zero means unknown;
 // the renderer falls back to the last LRC timestamp in that case (less
 // accurate because the tail of a song is typically silent/instrumental).
+// syncedIsApproximate=true means the entries in Synced were synthesized
+// from Plain (no real per-line timestamps); the renderer should use
+// position-fraction-based scrolling and skip the active-line highlight.
 type Lyrics struct {
-	QueryKey string
-	Synced   []LRCLine
-	Plain    string
-	Found    bool
-	Source   string
-	Duration time.Duration
+	QueryKey            string
+	Synced              []LRCLine
+	Plain               string
+	Found               bool
+	Source              string
+	Duration            time.Duration
+	SyncedIsApproximate bool
 }
 
 // lyricsCache keeps results keyed by "artist|title" for the process lifetime.
@@ -181,9 +185,21 @@ func fetchLyrics(artist, title string) *Lyrics {
 		hit.Source = p.name
 		hit.QueryKey = result.QueryKey
 		dropBlankLines(hit)
+		// when the provider returned only unsynced plain text, synthesize
+		// fake-timestamped synced entries so the same annotation + render
+		// pipeline can give us romaji + translation per line. the marker
+		// SyncedIsApproximate=true tells the renderer to scroll via
+		// position fraction and skip active-line highlighting since the
+		// timestamps aren't real.
+		synthesizeSyncedFromPlain(hit)
 		annotateRomaji(hit)
 		annotateTranslations(hit)
-		insertGapMarkers(hit)
+		// gap markers only make sense for real per-line timestamps; skip
+		// them on synthetic syncs (no actual "instrumental silences" to
+		// detect when timestamps are fake).
+		if !hit.SyncedIsApproximate {
+			insertGapMarkers(hit)
+		}
 		return hit
 	}
 	return result
@@ -232,6 +248,55 @@ func applyTranslationLRC(l *Lyrics, rawLRC string) {
 			ti++
 		}
 	}
+}
+
+// synthesizeSyncedFromPlain builds fake-timestamped synced entries from
+// Plain when the provider didn't supply any actual synced data. lets the
+// downstream annotation + rendering pipeline give plain-text lyrics the
+// same romaji + translation treatment as proper synced ones. timestamps
+// are evenly distributed across the song duration so the position-
+// fraction-based scroll still drifts roughly in time with playback.
+//
+// noop when Synced is already populated or Plain is empty.
+func synthesizeSyncedFromPlain(l *Lyrics) {
+	if l == nil || len(l.Synced) > 0 {
+		return
+	}
+	plain := strings.TrimSpace(l.Plain)
+	if plain == "" {
+		return
+	}
+
+	var rawLines []string
+	for _, raw := range strings.Split(plain, "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" {
+			continue
+		}
+		rawLines = append(rawLines, line)
+	}
+	if len(rawLines) == 0 {
+		return
+	}
+
+	total := l.Duration
+	if total == 0 {
+		// fall back to nominal pacing — 3 seconds per line. only used for
+		// the relative ordering of fake timestamps; the renderer's
+		// position-fraction estimate is what actually drives scrolling.
+		total = time.Duration(len(rawLines)) * 3 * time.Second
+	}
+
+	step := total / time.Duration(len(rawLines))
+	out := make([]LRCLine, 0, len(rawLines))
+	for i, line := range rawLines {
+		out = append(out, LRCLine{
+			At:   time.Duration(i) * step,
+			Text: line,
+		})
+	}
+	l.Synced = out
+	l.SyncedIsApproximate = true
 }
 
 // dropBlankLines removes synced entries whose text is empty after trim.
