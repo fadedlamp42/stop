@@ -748,16 +748,24 @@ func renderLyricsViewport(artist, title string, positionFrac float64, width, hei
 			}
 		}
 
-		visual := flattenSynced(lyrics.Synced)
+		// inner = available chars after the 2-char gutter we prepend per row.
+		// passing it to flattenSynced lets long lines wrap into multiple rows
+		// instead of being ellipsized.
+		visualInner := width - 2
+		if visualInner < 8 {
+			visualInner = 8
+		}
+		visual := flattenSynced(lyrics.Synced, visualInner)
 
-		// find the visual index of the scroll anchor's first (text) row.
-		// used to center the viewport. when scrollAnchor differs from
-		// active (pre-vocal case), no row gets the active bold treatment
-		// but the viewport still drifts towards the upcoming entry.
+		// find the visual index of the scroll anchor's first text row
+		// (isFirst==true filters out wrap continuations). used to center
+		// the viewport. when scrollAnchor differs from active (pre-vocal
+		// case), no row gets the active bold treatment but the viewport
+		// still drifts towards the upcoming entry.
 		activeVisual := -1
 		if scrollAnchor >= 0 {
 			for vi, v := range visual {
-				if v.srcIdx == scrollAnchor && v.kind == lyricKindText {
+				if v.srcIdx == scrollAnchor && v.kind == lyricKindText && v.isFirst {
 					activeVisual = vi
 					break
 				}
@@ -882,33 +890,101 @@ const (
 )
 
 // lyricVisualRow is one rendered line within the lyrics viewport. each
-// source LRC entry expands into 1-3 of these depending on which optional
-// fields are populated.
+// source LRC entry expands into 1..N of these depending on text length
+// (long lines wrap into multiple rows) and which optional fields are
+// populated (romaji, translation). isFirst marks the first wrapped row
+// of a given (srcIdx, kind) chunk — only the first text row of the
+// active LRC entry shows the "> " marker; subsequent wrap rows align
+// without a marker so the indent stays consistent.
 type lyricVisualRow struct {
-	srcIdx int
-	kind   lyricRowKind
-	text   string
+	srcIdx  int
+	kind    lyricRowKind
+	text    string
+	isFirst bool
 }
 
 // flattenSynced expands an LRC stream into the per-visual-row stream the
-// viewport consumes. blank-text entries are dropped upstream by
-// dropBlankLines so every entry here contributes at least one row (the
-// original text); romaji + translation rows only appear when populated.
-func flattenSynced(synced []LRCLine) []lyricVisualRow {
+// viewport consumes. each entry's text/romaji/translation wraps to the
+// available `inner` width so long lines never get ellipsized — they take
+// as many rows as they need to render fully. blank-text entries are
+// dropped upstream by dropBlankLines so every entry here contributes at
+// least one row (the wrapped original text).
+func flattenSynced(synced []LRCLine, inner int) []lyricVisualRow {
 	rows := make([]lyricVisualRow, 0, len(synced))
+	emit := func(srcIdx int, kind lyricRowKind, body string) {
+		chunks := wrapForWidth(body, inner)
+		for ci, c := range chunks {
+			rows = append(rows, lyricVisualRow{
+				srcIdx:  srcIdx,
+				kind:    kind,
+				text:    c,
+				isFirst: ci == 0,
+			})
+		}
+	}
 	for i, l := range synced {
 		if l.Text == "" {
 			continue // defensive: should be stripped by dropBlankLines already
 		}
-		rows = append(rows, lyricVisualRow{srcIdx: i, kind: lyricKindText, text: l.Text})
+		emit(i, lyricKindText, l.Text)
 		if l.Romaji != "" {
-			rows = append(rows, lyricVisualRow{srcIdx: i, kind: lyricKindRomaji, text: l.Romaji})
+			emit(i, lyricKindRomaji, l.Romaji)
 		}
 		if l.Translation != "" {
-			rows = append(rows, lyricVisualRow{srcIdx: i, kind: lyricKindTranslation, text: l.Translation})
+			emit(i, lyricKindTranslation, l.Translation)
 		}
 	}
 	return rows
+}
+
+// wrapForWidth breaks s into runs each at most `width` cells wide
+// (runewidth measured). prefers space-boundary breaks; falls back to a
+// hard mid-string split when no good break point exists (single long
+// word, or text without spaces such as CJK). always returns at least
+// one element; empty input → []string{""}.
+func wrapForWidth(s string, width int) []string {
+	if width < 2 {
+		width = 2
+	}
+	if runewidth.StringWidth(s) <= width {
+		return []string{s}
+	}
+	var out []string
+	var line []rune
+	lineW := 0
+	lastSpace := -1 // index within `line` of the most recent space rune
+	for _, r := range s {
+		rw := runewidth.RuneWidth(r)
+		if lineW+rw > width {
+			if lastSpace > 0 {
+				// break at last space — emit everything before it, keep
+				// what came after for the next line.
+				out = append(out, strings.TrimRight(string(line[:lastSpace]), " "))
+				tail := append([]rune{}, line[lastSpace+1:]...)
+				line = tail
+				lineW = runewidth.StringWidth(string(line))
+				lastSpace = -1
+			} else {
+				// no break point — hard split mid-content (typical for CJK
+				// or single very long words).
+				out = append(out, string(line))
+				line = line[:0]
+				lineW = 0
+			}
+		}
+		if r == ' ' && lineW > 0 {
+			lastSpace = len(line)
+		}
+		line = append(line, r)
+		lineW += rw
+	}
+	if len(line) > 0 {
+		out = append(out, strings.TrimRight(string(line), " "))
+	}
+	if len(out) == 0 {
+		out = []string{""}
+	}
+	return out
 }
 
 // renderLyricVisualRow paints one row from the expanded stream into the
@@ -943,20 +1019,23 @@ func renderLyricVisualRow(v lyricVisualRow, activeIdx int, havePosition, activeI
 			}
 			return style.Render("  " + strings.Repeat(" ", pad) + body)
 		}
+		// only the FIRST wrap row of the active LRC entry gets the "> "
+		// marker. continuation rows align with the same 2-char gutter so
+		// the wrapped text reads as a single visual block.
 		gutter := "  "
-		if havePosition && v.srcIdx == activeIdx {
+		if havePosition && v.srcIdx == activeIdx && v.isFirst {
 			gutter = "> "
 		}
-		body := truncateForWidth(v.text, inner)
-		return style.Render(gutter + body)
-	default: // romaji or translation — right-aligned, no marker
-		body := truncateForWidth(v.text, inner)
-		bodyWidth := runewidth.StringWidth(body)
+		return style.Render(gutter + v.text)
+	default: // romaji or translation — right-aligned, no marker, each
+		// wrap row right-aligned independently so the result reads like
+		// a right-aligned paragraph.
+		bodyWidth := runewidth.StringWidth(v.text)
 		padCount := inner - bodyWidth
 		if padCount < 0 {
 			padCount = 0
 		}
-		return style.Render("  " + strings.Repeat(" ", padCount) + body)
+		return style.Render("  " + strings.Repeat(" ", padCount) + v.text)
 	}
 }
 

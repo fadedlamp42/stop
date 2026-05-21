@@ -187,7 +187,9 @@ func TestFlattenSynced(t *testing.T) {
 		// upstream by dropBlankLines).
 		{Text: "", Romaji: "", Translation: ""},
 	}
-	rows := flattenSynced(synced)
+	// big width so nothing wraps — keeps the row counts exactly what the
+	// test wants to assert (1 per text + 1 per romaji + 1 per translation).
+	rows := flattenSynced(synced, 200)
 	wantCounts := []int{1, 2, 3, 0}
 	got := make([]int, len(synced))
 	for _, r := range rows {
@@ -215,6 +217,98 @@ func TestDropBlankLines(t *testing.T) {
 	}
 	if l.Synced[0].Text != "first" || l.Synced[1].Text != "last" {
 		t.Fatalf("wrong entries kept: %+v", l.Synced)
+	}
+}
+
+func TestWrapForWidth(t *testing.T) {
+	// ASCII with spaces — word-boundary breaks preferred
+	got := wrapForWidth("the quick brown fox jumps over the lazy dog", 20)
+	for _, line := range got {
+		if len(line) > 20 {
+			t.Fatalf("line too wide: %q (%d)", line, len(line))
+		}
+	}
+	if len(got) < 2 {
+		t.Fatalf("expected wrap into >=2 lines, got %d: %+v", len(got), got)
+	}
+	if got[0] != "the quick brown fox" {
+		t.Fatalf("first line broken at wrong word: %q", got[0])
+	}
+
+	// CJK without spaces — hard-split by character
+	got = wrapForWidth("嗚呼いつもの様にだ過ぎる日々にあくびが出る", 10)
+	for _, line := range got {
+		w := 0
+		for _, r := range line {
+			if r == ' ' {
+				continue
+			}
+			// each CJK char = 2 cells, target is 10 cells
+			w += 2
+		}
+		if w > 10 {
+			t.Fatalf("CJK line too wide: %q (cells %d)", line, w)
+		}
+	}
+	if len(got) < 2 {
+		t.Fatalf("CJK should have wrapped: %+v", got)
+	}
+
+	// single word longer than width — hard split applies
+	got = wrapForWidth("superlongunbreakableword", 5)
+	if len(got) < 2 {
+		t.Fatalf("long word should be hard-split, got %+v", got)
+	}
+
+	// fits in one — return original
+	got = wrapForWidth("short", 20)
+	if len(got) != 1 || got[0] != "short" {
+		t.Fatalf("short string should not wrap: %+v", got)
+	}
+}
+
+func TestFlattenSyncedWrap(t *testing.T) {
+	// long English text with romaji + translation — expect multiple wrap
+	// rows per kind. with inner=20, "the quick brown fox jumps over the lazy
+	// dog" wraps into 3 lines for both text + translation.
+	synced := []LRCLine{
+		{
+			Text:        "the quick brown fox jumps over the lazy dog",
+			Translation: "the quick brown fox jumps over the lazy dog",
+		},
+	}
+	rows := flattenSynced(synced, 20)
+	textRows := 0
+	transRows := 0
+	for _, r := range rows {
+		switch r.kind {
+		case lyricKindText:
+			textRows++
+		case lyricKindTranslation:
+			transRows++
+		}
+	}
+	if textRows < 2 {
+		t.Fatalf("expected text to wrap into >=2 rows, got %d", textRows)
+	}
+	if transRows < 2 {
+		t.Fatalf("expected translation to wrap into >=2 rows, got %d", transRows)
+	}
+	// first text row should be marked isFirst, others not
+	firstSeen := false
+	for _, r := range rows {
+		if r.kind != lyricKindText {
+			continue
+		}
+		if r.isFirst {
+			if firstSeen {
+				t.Fatal("multiple text rows marked isFirst within one LRC entry")
+			}
+			firstSeen = true
+		}
+	}
+	if !firstSeen {
+		t.Fatal("expected first text row to be marked isFirst")
 	}
 }
 
