@@ -97,16 +97,19 @@ func fetchFromLrclib(artist, title string) *Lyrics {
 			if err := httpGetJSON("https://lrclib.net/api/search?"+q.Encode(), nil, &hits); err != nil {
 				continue
 			}
+			// strict acceptance: require artist OR title to roughly match.
+			// the previous "accept first hit with lyrics" fallback was
+			// a false-positive farm — when a track had no lyrics on
+			// lrclib, we'd return some unrelated song's lyrics just
+			// because they were the first non-empty result.
 			for _, h := range hits {
-				if !artistsRoughlyMatch(h.ArtistName, pair.Artist) && !artistsRoughlyMatch(h.ArtistName, artist) {
+				artistOK := artistsRoughlyMatch(h.ArtistName, pair.Artist) ||
+					artistsRoughlyMatch(h.ArtistName, artist)
+				titleOK := titlesRoughlyMatch(h.TrackName, pair.Title) ||
+					titlesRoughlyMatch(h.TrackName, title)
+				if !artistOK && !titleOK {
 					continue
 				}
-				if hit := buildLyricsFromLRC(h.SyncedLyrics, h.PlainLyrics); hit != nil {
-					hit.Duration = time.Duration(h.Duration * float64(time.Second))
-					return hit
-				}
-			}
-			for _, h := range hits {
 				if hit := buildLyricsFromLRC(h.SyncedLyrics, h.PlainLyrics); hit != nil {
 					hit.Duration = time.Duration(h.Duration * float64(time.Second))
 					return hit
@@ -204,8 +207,14 @@ func fetchFromNetease(artist, title string) *Lyrics {
 // matches come first. exact title + artist match takes priority, then
 // title-only matches (covers the case where netease has the song under a
 // localized artist name), then everything else in original order.
+// neteaseRank returns candidates ordered by match confidence. results in
+// the "rest" bucket (neither title nor artist match) are DROPPED — they
+// were a false-positive farm: when the actual track had no lyrics in
+// netease's database, we'd silently fall through to a totally different
+// song by the same artist and serve its lyrics. better to miss than to
+// false-positive lyrics on the wrong song.
 func neteaseRank(songs []neteaseSong, artist, title string) []neteaseSong {
-	var both, titleOnly, rest []neteaseSong
+	var both, titleOnly []neteaseSong
 	for _, s := range songs {
 		a := ""
 		if len(s.Artists) > 0 {
@@ -218,13 +227,9 @@ func neteaseRank(songs []neteaseSong, artist, title string) []neteaseSong {
 			both = append(both, s)
 		case titleOK:
 			titleOnly = append(titleOnly, s)
-		default:
-			rest = append(rest, s)
 		}
 	}
-	out := append(both, titleOnly...)
-	out = append(out, rest...)
-	return out
+	return append(both, titleOnly...)
 }
 
 func fetchNeteaseLyric(songID int) *Lyrics {
@@ -328,8 +333,11 @@ func fetchFromQQMusic(artist, title string) *Lyrics {
 	return nil
 }
 
+// qqRank: same false-positive guard as neteaseRank — drop the "neither
+// matched" bucket so we never serve a different song's lyrics just
+// because the right song was missing them in qq's database.
 func qqRank(songs []qqSong, artist, title string) []qqSong {
-	var both, titleOnly, rest []qqSong
+	var both, titleOnly []qqSong
 	for _, s := range songs {
 		a := ""
 		if len(s.Singer) > 0 {
@@ -342,13 +350,9 @@ func qqRank(songs []qqSong, artist, title string) []qqSong {
 			both = append(both, s)
 		case titleOK:
 			titleOnly = append(titleOnly, s)
-		default:
-			rest = append(rest, s)
 		}
 	}
-	out := append(both, titleOnly...)
-	out = append(out, rest...)
-	return out
+	return append(both, titleOnly...)
 }
 
 func fetchQQLyric(songmid string) *Lyrics {

@@ -75,20 +75,24 @@ func TestNormalizeAndMatch(t *testing.T) {
 
 func TestNeteaseRanking(t *testing.T) {
 	songs := []neteaseSong{
-		{ID: 1, Name: "Cover", Artists: []neteaseArtist{{Name: "Random"}}},
-		{ID: 2, Name: "Bohemian Rhapsody", Artists: []neteaseArtist{{Name: "Queen"}}},
-		{ID: 3, Name: "Bohemian Rhapsody", Artists: []neteaseArtist{{Name: "Other"}}},
+		{ID: 1, Name: "Cover", Artists: []neteaseArtist{{Name: "Random"}}},                  // neither — dropped
+		{ID: 2, Name: "Bohemian Rhapsody", Artists: []neteaseArtist{{Name: "Queen"}}},        // both
+		{ID: 3, Name: "Bohemian Rhapsody", Artists: []neteaseArtist{{Name: "Other"}}},        // title only
+		{ID: 4, Name: "Another Song", Artists: []neteaseArtist{{Name: "Queen"}}},             // artist only — DROPPED
 	}
 	ranked := neteaseRank(songs, "Queen", "Bohemian Rhapsody")
+	if len(ranked) != 2 {
+		t.Fatalf("expected 2 results (both + titleOnly), got %d: %+v", len(ranked), ranked)
+	}
 	if ranked[0].ID != 2 {
 		t.Fatalf("expected ID 2 first (artist+title match), got %d", ranked[0].ID)
 	}
 	if ranked[1].ID != 3 {
 		t.Fatalf("expected ID 3 second (title only), got %d", ranked[1].ID)
 	}
-	if ranked[2].ID != 1 {
-		t.Fatalf("expected ID 1 last (no match), got %d", ranked[2].ID)
-	}
+	// IDs 1 (no match) and 4 (artist-only — different song by same artist)
+	// must be dropped to avoid the false-positive class where a different
+	// song by the queried artist serves its lyrics instead of the real track.
 }
 
 func TestBuildLyricsFromLRC(t *testing.T) {
