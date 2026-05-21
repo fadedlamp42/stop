@@ -22,6 +22,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 )
 
 // -- title translation cache --
@@ -134,11 +135,18 @@ func translateBatch(inputs []string) []string {
 	const delim = "@@@"
 	joined := strings.Join(inputs, delim)
 
-	// google translate's web/mobile API: gtx client, auto-detect source
-	// (sl=auto), target english (tl=en), retrieve translation (dt=t).
+	// google translate's web/mobile API: gtx client, target english
+	// (tl=en), retrieve translation (dt=t). source language is detected
+	// from the joined input — defaulting to sl=auto sounds fine in
+	// theory but in practice google misdetects mostly-latin batches with
+	// a few non-latin words, and worse, refuses to translate romaji even
+	// when sl=ja is passed. our detection biases toward the dominant
+	// non-latin script (kana → ja, hangul → ko, han-only → zh-CN) and
+	// falls back to auto when the input is mostly latin.
+	sl := detectSourceLanguage(joined)
 	u := "https://translate.googleapis.com/translate_a/single?" + url.Values{
 		"client": {"gtx"},
-		"sl":     {"auto"},
+		"sl":     {sl},
 		"tl":     {"en"},
 		"dt":     {"t"},
 		"q":      {joined},
@@ -195,3 +203,36 @@ func translateBatch(inputs []string) []string {
 // our "@@@" sentinel ("foo @@@ bar", "foo@@@bar", "foo  @@@  bar" are
 // all valid post-translation forms).
 var delimSplitter = regexp.MustCompile(`\s*@@@\s*`)
+
+// detectSourceLanguage picks the most reliable `sl=` value for a chunk
+// of text. presence of kana → "ja" (even alongside han chars, since kana
+// is unambiguously japanese). hangul → "ko". han-only → "zh-CN".
+// otherwise "auto" — let google guess, since the input might be a
+// european language or a mix without a dominant non-latin script.
+//
+// passing an explicit sl whenever we can defends against the most
+// common no-op pattern: google misdetecting a mostly-latin batch with a
+// few non-latin words as english and returning the input unchanged.
+func detectSourceLanguage(s string) string {
+	var kana, hangul, han int
+	for _, r := range s {
+		switch {
+		case unicode.Is(unicode.Hiragana, r), unicode.Is(unicode.Katakana, r):
+			kana++
+		case unicode.Is(unicode.Hangul, r):
+			hangul++
+		case unicode.Is(unicode.Han, r):
+			han++
+		}
+	}
+	if kana > 0 {
+		return "ja"
+	}
+	if hangul > 0 {
+		return "ko"
+	}
+	if han > 0 {
+		return "zh-CN"
+	}
+	return "auto"
+}
