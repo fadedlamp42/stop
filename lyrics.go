@@ -118,9 +118,12 @@ func lyricsFetchInFlight(artist, title string) bool {
 }
 
 // ensureLyricsFetch kicks off a background fetch if we don't have a cached
-// result and aren't already fetching this song. returns whether a fetch was
-// started (so the caller can schedule a re-render after a short delay).
-func ensureLyricsFetch(artist, title string) bool {
+// result and aren't already fetching this song. returns whether a fetch
+// was started (so the caller can schedule a re-render after a short
+// delay). spotifyDur is forwarded to the provider chain so candidates
+// can be disambiguated by runtime when title/artist don't roughly match
+// (translated titles, transliterated artists).
+func ensureLyricsFetch(artist, title string, spotifyDur time.Duration) bool {
 	if artist == "" || title == "" {
 		return false
 	}
@@ -138,7 +141,7 @@ func ensureLyricsFetch(artist, title string) bool {
 	lyricsMu.Unlock()
 
 	go func() {
-		result := fetchLyrics(artist, title)
+		result := fetchLyrics(artist, title, spotifyDur)
 		lyricsMu.Lock()
 		lyricsBySong[key] = result
 		delete(lyricsInFlight, key)
@@ -152,13 +155,21 @@ var httpClient = &http.Client{Timeout: 6 * time.Second}
 
 const userAgent = "stop/0.1 (https://github.com/regular/stop)"
 
-// lyricsProvider is one source of LRC/plain lyrics. providers are tried in
-// order until one returns a usable result. each provider is responsible
+// lyricsProvider is one source of LRC/plain lyrics. providers are tried
+// in order until one returns a usable result. each provider is responsible
 // for its own HTTP calls, parsing, and tolerance — they return a populated
 // *Lyrics on success (with Source set) or nil on miss.
+//
+// fetch is passed the spotify-reported track duration so providers can
+// disambiguate candidates by runtime when metadata is translated /
+// transliterated across services. duration is the single most reliable
+// signal we have for "same song" when neither artist nor title match by
+// string (e.g. spotify shows "nihosika" + english translation, netease
+// has the hiragana original "にほしか" + japanese kanji title — the
+// 179s runtime is what lets us connect them).
 type lyricsProvider struct {
 	name  string
-	fetch func(artist, title string) *Lyrics
+	fetch func(artist, title string, spotifyDur time.Duration) *Lyrics
 }
 
 // lyricsProviders is the fallback chain. order matters: lrclib first
@@ -175,10 +186,10 @@ var lyricsProviders = []lyricsProvider{
 // fetchLyrics walks the provider chain and returns the first hit. always
 // returns a non-nil *Lyrics so the cache layer can remember misses too
 // and avoid re-hammering every provider on the next tick.
-func fetchLyrics(artist, title string) *Lyrics {
+func fetchLyrics(artist, title string, spotifyDur time.Duration) *Lyrics {
 	result := &Lyrics{QueryKey: songKey(artist, title)}
 	for _, p := range lyricsProviders {
-		hit := p.fetch(artist, title)
+		hit := p.fetch(artist, title, spotifyDur)
 		if hit == nil || !hit.Found {
 			continue
 		}
@@ -203,6 +214,27 @@ func fetchLyrics(artist, title string) *Lyrics {
 		return hit
 	}
 	return result
+}
+
+// durationMatchTolerance is how close two reported track lengths need to
+// be to count as "same song". 3s covers normal rip-to-rip variation
+// (silence trimming, fade-out cropping) without admitting genuinely
+// different songs that happen to share an artist or title fragment.
+const durationMatchTolerance = 3 * time.Second
+
+// durationsMatch reports whether two durations are within the tolerance.
+// returns false when either is zero so we don't false-positive on missing
+// data — duration matching is opt-in and the caller falls back to other
+// signals when it can't help.
+func durationsMatch(a, b time.Duration) bool {
+	if a <= 0 || b <= 0 {
+		return false
+	}
+	diff := a - b
+	if diff < 0 {
+		diff = -diff
+	}
+	return diff <= durationMatchTolerance
 }
 
 // annotateRomaji populates Synced[i].Romaji for any line that contains

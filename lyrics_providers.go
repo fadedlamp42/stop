@@ -57,7 +57,7 @@ type lrclibResult struct {
 	SyncedLyrics string  `json:"syncedLyrics"`
 }
 
-func fetchFromLrclib(artist, title string) *Lyrics {
+func fetchFromLrclib(artist, title string, spotifyDur time.Duration) *Lyrics {
 	// for each (artist, title) variant — original first, then transliterated
 	// forms — try the full query chain. order matters: variants come in
 	// rough confidence order so the most-likely-correct one is consulted
@@ -97,21 +97,27 @@ func fetchFromLrclib(artist, title string) *Lyrics {
 			if err := httpGetJSON("https://lrclib.net/api/search?"+q.Encode(), nil, &hits); err != nil {
 				continue
 			}
-			// strict acceptance: require artist OR title to roughly match.
-			// the previous "accept first hit with lyrics" fallback was
-			// a false-positive farm — when a track had no lyrics on
-			// lrclib, we'd return some unrelated song's lyrics just
-			// because they were the first non-empty result.
+			// acceptance requires two independent signals:
+			//   (artist + title BOTH match), OR
+			//   duration matches within tolerance
+			// duration is the objective tiebreaker that lets us connect
+			// translated/transliterated metadata (spotify shows "nihosika"
+			// + english translation, netease has "にほしか" + japanese
+			// kanji — neither field string-matches but the 179s runtime
+			// is the same). when duration is unknown we fall back to
+			// strict artist+title match.
 			for _, h := range hits {
 				artistOK := artistsRoughlyMatch(h.ArtistName, pair.Artist) ||
 					artistsRoughlyMatch(h.ArtistName, artist)
 				titleOK := titlesRoughlyMatch(h.TrackName, pair.Title) ||
 					titlesRoughlyMatch(h.TrackName, title)
-				if !artistOK && !titleOK {
+				hitDur := time.Duration(h.Duration * float64(time.Second))
+				durOK := durationsMatch(hitDur, spotifyDur)
+				if !(artistOK && titleOK) && !durOK {
 					continue
 				}
 				if hit := buildLyricsFromLRC(h.SyncedLyrics, h.PlainLyrics); hit != nil {
-					hit.Duration = time.Duration(h.Duration * float64(time.Second))
+					hit.Duration = hitDur
 					return hit
 				}
 			}
@@ -160,7 +166,7 @@ var neteaseHeaders = map[string]string{
 	"Referer": "https://music.163.com/",
 }
 
-func fetchFromNetease(artist, title string) *Lyrics {
+func fetchFromNetease(artist, title string, spotifyDur time.Duration) *Lyrics {
 	// each (artist, title) variant gets the combined-query + title-only
 	// (gated) fallback chain. transliterated variants let us hit netease
 	// entries filed under the form spotify didn't report.
@@ -191,13 +197,13 @@ func fetchFromNetease(artist, title string) *Lyrics {
 			// neither directly. the rank function's permissive substring
 			// match handles a lot of this; passing the original as a
 			// secondary hint catches the rest.
-			ranked := neteaseRank(songs, pair.Artist, pair.Title)
-			for _, s := range ranked {
-				if hit := fetchNeteaseLyric(s.ID); hit != nil {
-					hit.Duration = time.Duration(s.Duration) * time.Millisecond
-					return hit
-				}
+		ranked := neteaseRank(songs, pair.Artist, pair.Title, spotifyDur)
+		for _, s := range ranked {
+			if hit := fetchNeteaseLyric(s.ID); hit != nil {
+				hit.Duration = time.Duration(s.Duration) * time.Millisecond
+				return hit
 			}
+		}
 		}
 	}
 	return nil
@@ -207,14 +213,21 @@ func fetchFromNetease(artist, title string) *Lyrics {
 // matches come first. exact title + artist match takes priority, then
 // title-only matches (covers the case where netease has the song under a
 // localized artist name), then everything else in original order.
-// neteaseRank returns candidates ordered by match confidence. results in
-// the "rest" bucket (neither title nor artist match) are DROPPED — they
-// were a false-positive farm: when the actual track had no lyrics in
-// netease's database, we'd silently fall through to a totally different
-// song by the same artist and serve its lyrics. better to miss than to
-// false-positive lyrics on the wrong song.
-func neteaseRank(songs []neteaseSong, artist, title string) []neteaseSong {
-	var both, titleOnly []neteaseSong
+// neteaseRank returns candidates ordered by match confidence. acceptance
+// requires two independent signals — (artist+title both match) or
+// (duration matches spotify within tolerance). duration is the objective
+// tiebreaker that connects translated/transliterated metadata across
+// services. anything failing both checks gets dropped (e.g. an artist-
+// only match without a matching runtime, the false-positive class that
+// previously served other-songs-by-same-artist when the real track
+// lacked lyrics).
+//
+// ordering inside the accepted set: artist+title matches first (rank by
+// confidence), then duration-only matches (still high signal but
+// cross-language). duration matches with title also matching are
+// equivalent to artist+title for prioritization purposes.
+func neteaseRank(songs []neteaseSong, artist, title string, spotifyDur time.Duration) []neteaseSong {
+	var bothOrTitleAndDur, durOnly []neteaseSong
 	for _, s := range songs {
 		a := ""
 		if len(s.Artists) > 0 {
@@ -222,14 +235,17 @@ func neteaseRank(songs []neteaseSong, artist, title string) []neteaseSong {
 		}
 		artistOK := artistsRoughlyMatch(a, artist)
 		titleOK := titlesRoughlyMatch(s.Name, title)
+		durOK := durationsMatch(time.Duration(s.Duration)*time.Millisecond, spotifyDur)
 		switch {
 		case artistOK && titleOK:
-			both = append(both, s)
-		case titleOK:
-			titleOnly = append(titleOnly, s)
+			bothOrTitleAndDur = append(bothOrTitleAndDur, s)
+		case titleOK && durOK:
+			bothOrTitleAndDur = append(bothOrTitleAndDur, s)
+		case durOK:
+			durOnly = append(durOnly, s)
 		}
 	}
-	return append(both, titleOnly...)
+	return append(bothOrTitleAndDur, durOnly...)
 }
 
 func fetchNeteaseLyric(songID int) *Lyrics {
@@ -297,7 +313,7 @@ var qqHeaders = map[string]string{
 	"Referer": "https://y.qq.com/",
 }
 
-func fetchFromQQMusic(artist, title string) *Lyrics {
+func fetchFromQQMusic(artist, title string, spotifyDur time.Duration) *Lyrics {
 	// same fallback shape as netease: iterate (artist, title) variants ×
 	// (combined-query, title-only-gated) queries.
 	for _, pair := range expandSearchPairs(artist, title) {
@@ -321,7 +337,7 @@ func fetchFromQQMusic(artist, title string) *Lyrics {
 			if len(songs) == 0 {
 				continue
 			}
-			ranked := qqRank(songs, pair.Artist, pair.Title)
+			ranked := qqRank(songs, pair.Artist, pair.Title, spotifyDur)
 			for _, s := range ranked {
 				if hit := fetchQQLyric(s.SongMID); hit != nil {
 					hit.Duration = time.Duration(s.Interval) * time.Second
@@ -333,11 +349,11 @@ func fetchFromQQMusic(artist, title string) *Lyrics {
 	return nil
 }
 
-// qqRank: same false-positive guard as neteaseRank — drop the "neither
-// matched" bucket so we never serve a different song's lyrics just
-// because the right song was missing them in qq's database.
-func qqRank(songs []qqSong, artist, title string) []qqSong {
-	var both, titleOnly []qqSong
+// qqRank: same two-signal acceptance as neteaseRank — (artist+title) OR
+// duration match required, with duration as the cross-language
+// disambiguator. qq's Interval field is in whole seconds.
+func qqRank(songs []qqSong, artist, title string, spotifyDur time.Duration) []qqSong {
+	var bothOrTitleAndDur, durOnly []qqSong
 	for _, s := range songs {
 		a := ""
 		if len(s.Singer) > 0 {
@@ -345,14 +361,17 @@ func qqRank(songs []qqSong, artist, title string) []qqSong {
 		}
 		artistOK := artistsRoughlyMatch(a, artist)
 		titleOK := titlesRoughlyMatch(s.SongName, title)
+		durOK := durationsMatch(time.Duration(s.Interval)*time.Second, spotifyDur)
 		switch {
 		case artistOK && titleOK:
-			both = append(both, s)
-		case titleOK:
-			titleOnly = append(titleOnly, s)
+			bothOrTitleAndDur = append(bothOrTitleAndDur, s)
+		case titleOK && durOK:
+			bothOrTitleAndDur = append(bothOrTitleAndDur, s)
+		case durOK:
+			durOnly = append(durOnly, s)
 		}
 	}
-	return append(both, titleOnly...)
+	return append(bothOrTitleAndDur, durOnly...)
 }
 
 func fetchQQLyric(songmid string) *Lyrics {

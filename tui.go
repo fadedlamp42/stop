@@ -112,7 +112,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case metaMsg:
 		m.playingMeta = PlayingMeta(msg)
 		if artist, title := parseNowPlaying(m.playingMeta.DisplayString()); artist != "" {
-			ensureLyricsFetch(artist, title)
+			ensureLyricsFetch(artist, title, m.playingMeta.songDuration())
 			ensureTitleTranslation(artist, title)
 		}
 		return m, metaSampleCmd()
@@ -193,9 +193,11 @@ func (m model) handleData(result fetchResult) (tea.Model, tea.Cmd) {
 
 	// kick off lyrics fetch + title translation when a song is known.
 	// both are cached per artist|title, so re-issuing on every tick is
-	// cheap once the song's been resolved.
+	// cheap once the song's been resolved. duration is passed so the
+	// fetch can use it as a cross-language disambiguator when matching
+	// translated/transliterated metadata.
 	if artist, title := parseNowPlaying(m.playingMeta.DisplayString()); artist != "" {
-		ensureLyricsFetch(artist, title)
+		ensureLyricsFetch(artist, title, m.playingMeta.songDuration())
 		ensureTitleTranslation(artist, title)
 	}
 

@@ -82,6 +82,16 @@ func queryPlayingMeta() PlayingMeta {
 	return meta
 }
 
+// songDuration converts the float-seconds Duration field into a
+// time.Duration. zero when unknown — that signals "skip duration-based
+// match" to the lyrics fetcher.
+func (m PlayingMeta) songDuration() time.Duration {
+	if m.Duration <= 0 {
+		return 0
+	}
+	return time.Duration(m.Duration * float64(time.Second))
+}
+
 // DisplayString renders the meta for the UI's now-playing line. matches
 // the legacy /scripts/playing output: empty when nothing, "PAUSED" when
 // paused, "ARTIST - TITLE" when playing.

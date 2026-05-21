@@ -25,7 +25,7 @@ func TestLyricsLiveProviders(t *testing.T) {
 		for i, p := range pairs {
 			fmt.Printf("    [%d] %s | %s\n", i, p.Artist, p.Title)
 		}
-		hit := fetchLyrics(c.artist, c.title)
+		hit := fetchLyrics(c.artist, c.title, 0)
 		if hit == nil || !hit.Found {
 			fmt.Printf("[MISS] %s - %s\n", c.artist, c.title)
 			continue

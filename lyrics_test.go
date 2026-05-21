@@ -75,24 +75,36 @@ func TestNormalizeAndMatch(t *testing.T) {
 
 func TestNeteaseRanking(t *testing.T) {
 	songs := []neteaseSong{
-		{ID: 1, Name: "Cover", Artists: []neteaseArtist{{Name: "Random"}}},                  // neither — dropped
-		{ID: 2, Name: "Bohemian Rhapsody", Artists: []neteaseArtist{{Name: "Queen"}}},        // both
-		{ID: 3, Name: "Bohemian Rhapsody", Artists: []neteaseArtist{{Name: "Other"}}},        // title only
-		{ID: 4, Name: "Another Song", Artists: []neteaseArtist{{Name: "Queen"}}},             // artist only — DROPPED
+		{ID: 1, Name: "Cover", Artists: []neteaseArtist{{Name: "Random"}}},            // neither — dropped
+		{ID: 2, Name: "Bohemian Rhapsody", Artists: []neteaseArtist{{Name: "Queen"}}}, // both
+		{ID: 3, Name: "Bohemian Rhapsody", Artists: []neteaseArtist{{Name: "Other"}}}, // title only — dropped (no dur match)
+		{ID: 4, Name: "Another Song", Artists: []neteaseArtist{{Name: "Queen"}}},      // artist only — DROPPED
 	}
-	ranked := neteaseRank(songs, "Queen", "Bohemian Rhapsody")
-	if len(ranked) != 2 {
-		t.Fatalf("expected 2 results (both + titleOnly), got %d: %+v", len(ranked), ranked)
+	// no spotify duration → strict artist+title required
+	ranked := neteaseRank(songs, "Queen", "Bohemian Rhapsody", 0)
+	if len(ranked) != 1 || ranked[0].ID != 2 {
+		t.Fatalf("expected only ID 2 (artist+title match) when no duration is supplied, got %+v", ranked)
+	}
+
+	// with a spotify duration, candidates whose runtime matches get
+	// accepted even when other signals fail. add durations to validate.
+	songsDur := []neteaseSong{
+		{ID: 1, Name: "Cover", Artists: []neteaseArtist{{Name: "Random"}}, Duration: 100000},            // 100s
+		{ID: 2, Name: "Bohemian Rhapsody", Artists: []neteaseArtist{{Name: "Queen"}}, Duration: 355000}, // 355s
+		{ID: 3, Name: "Bohemian Rhapsody", Artists: []neteaseArtist{{Name: "Other"}}, Duration: 355000}, // title + dur match
+		{ID: 4, Name: "Translated Title", Artists: []neteaseArtist{{Name: "Translit"}}, Duration: 355000}, // dur match only
+	}
+	ranked = neteaseRank(songsDur, "Queen", "Bohemian Rhapsody", 355*time.Second)
+	if len(ranked) != 3 {
+		t.Fatalf("expected 3 (artist+title, title+dur, dur-only) with duration, got %d: %+v", len(ranked), ranked)
 	}
 	if ranked[0].ID != 2 {
-		t.Fatalf("expected ID 2 first (artist+title match), got %d", ranked[0].ID)
+		t.Fatalf("expected ID 2 first (artist+title), got %d", ranked[0].ID)
 	}
-	if ranked[1].ID != 3 {
-		t.Fatalf("expected ID 3 second (title only), got %d", ranked[1].ID)
+	// ID 4 (dur-only) should come after the title-matched candidates
+	if ranked[len(ranked)-1].ID != 4 {
+		t.Fatalf("expected dur-only ID 4 last, got %d", ranked[len(ranked)-1].ID)
 	}
-	// IDs 1 (no match) and 4 (artist-only — different song by same artist)
-	// must be dropped to avoid the false-positive class where a different
-	// song by the queried artist serves its lyrics instead of the real track.
 }
 
 func TestBuildLyricsFromLRC(t *testing.T) {
