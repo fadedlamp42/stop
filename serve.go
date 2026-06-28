@@ -59,7 +59,7 @@ func handleSpaces(w http.ResponseWriter, r *http.Request) {
 	}
 
 	nowMS := time.Now().UnixMilli()
-	productiveActivity := bestProductiveActivity(result.tmuxPanes)
+	productiveActivity := bestProductiveActivity(result.tmuxPanes, result.productivePanePIDs)
 	groups := buildDisplayGroups(result.spaces, result.windows)
 
 	// serialize displays
@@ -120,7 +120,7 @@ func handleSpaces(w http.ResponseWriter, r *http.Request) {
 					"command":          p.CurrentCommand,
 					"last_activity_ms": p.LastActivity.UnixMilli(),
 					"history_size":     p.HistorySize,
-					"productive":       isProductive(p.CurrentCommand),
+					"productive":       result.productivePanePIDs[p.PanePID],
 				})
 			}
 			windows = append(windows, map[string]any{

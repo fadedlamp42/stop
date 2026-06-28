@@ -335,27 +335,31 @@ func queryTmuxClients() []TmuxClient {
 	return clients
 }
 
-// queryProcessTree returns a pid → ppid map for all running processes.
-// used to walk from tmux client PIDs up to terminal emulator PIDs.
-func queryProcessTree() map[int]int {
+// queryProcessTree returns a pid → ppid map and pid → comm map for all
+// running processes. used to walk from tmux client PIDs up to terminal
+// emulator PIDs, and to detect productive process descendants.
+func queryProcessTree() (map[int]int, map[int]string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, "ps", "-eo", "pid,ppid").Output()
+	out, err := exec.CommandContext(ctx, "ps", "-eo", "pid,ppid,comm").Output()
 	if err != nil {
-		return nil
+		return nil, nil
 	}
 	tree := make(map[int]int)
+	comm := make(map[int]string)
 	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "PID") {
 			continue
 		}
 		var pid, ppid int
-		if _, err := fmt.Sscanf(line, "%d %d", &pid, &ppid); err == nil {
+		var cmd string
+		if _, err := fmt.Sscanf(line, "%d %d %s", &pid, &ppid, &cmd); err == nil {
 			tree[pid] = ppid
+			comm[pid] = cmd
 		}
 	}
-	return tree
+	return tree, comm
 }
 
 // focusSpace tells yabai to switch focus to a specific space index
@@ -365,34 +369,83 @@ func focusSpace(index int) {
 	exec.CommandContext(ctx, "yabai", "-m", "space", "--focus", fmt.Sprintf("%d", index)).Run()
 }
 
+// resolveProductivePanePIDs walks up from every productive process in the
+// system to find which tmux pane PIDs contain a productive descendant.
+// productive is defined by config.go's productiveProcesses map.
+// handles any nesting depth — a pane PID is marked productive if any
+// descendant process (child, grandchild, etc.) has a productive command.
+func resolveProductivePanePIDs(
+	panes []TmuxPane,
+	processTree map[int]int,
+	processComm map[int]string,
+) map[int]bool {
+	// build set of pane PIDs for fast lookup while walking up
+	panePIDs := make(map[int]bool, len(panes))
+	for _, p := range panes {
+		if p.PanePID > 0 {
+			panePIDs[p.PanePID] = true
+		}
+	}
+
+	// collect all pids whose command basename is productive
+	productivePIDs := make(map[int]bool)
+	for pid, cmd := range processComm {
+		if isProductive(filepath.Base(cmd)) {
+			productivePIDs[pid] = true
+		}
+	}
+
+	// walk up from each productive pid until we hit a pane pid
+	result := make(map[int]bool)
+	for pid := range productivePIDs {
+		cur := pid
+		for depth := 0; depth < 50; depth++ {
+			if panePIDs[cur] {
+				result[cur] = true
+				break
+			}
+			ppid, ok := processTree[cur]
+			if !ok || ppid <= 1 {
+				break
+			}
+			cur = ppid
+		}
+	}
+	return result
+}
+
 // -- concurrent fetch --
 
 // fetchResult holds the combined result of all concurrent queries
 type fetchResult struct {
-	spaces       []Space
-	windows      []Window
-	tmuxPanes    []TmuxPane
-	tmuxClients  []TmuxClient
-	processTree  map[int]int
-	nvimBuffers  map[int][]NvimBuffer // pane_pid → buffers (only for nvim panes)
-	nvimWindows  []NvimWindow         // flat list, each tagged with PanePID/NvimPID
-	nvimSessions []NvimSession        // one per reachable nvim instance
-	playingMeta PlayingMeta // single sample of player state used for both UI + interpolation
-	err         error
+	spaces               []Space
+	windows              []Window
+	tmuxPanes            []TmuxPane
+	tmuxClients          []TmuxClient
+	processTree          map[int]int
+	processComm          map[int]string
+	productivePanePIDs   map[int]bool
+	nvimBuffers          map[int][]NvimBuffer // pane_pid → buffers (only for nvim panes)
+	nvimWindows          []NvimWindow         // flat list, each tagged with PanePID/NvimPID
+	nvimSessions         []NvimSession        // one per reachable nvim instance
+	playingMeta          PlayingMeta          // single sample of player state used for both UI + interpolation
+	err                  error
 }
 
 // fetchAll queries yabai (spaces + windows) and tmux concurrently.
 // spaces query is required; windows and tmux are best-effort.
 func fetchAll() fetchResult {
 	var (
-		spaces      []Space
-		windows     []Window
-		tmuxPanes   []TmuxPane
-		tmuxClients []TmuxClient
-		processTree map[int]int
-		spaceErr    error
-		mu          sync.Mutex
-		wg          sync.WaitGroup
+		spaces              []Space
+		windows             []Window
+		tmuxPanes           []TmuxPane
+		tmuxClients         []TmuxClient
+		processTree         map[int]int
+		processComm         map[int]string
+		productivePanePIDs  map[int]bool
+		spaceErr            error
+		mu                  sync.Mutex
+		wg                  sync.WaitGroup
 	)
 
 	var playingMeta PlayingMeta
@@ -441,9 +494,10 @@ func fetchAll() fetchResult {
 
 	go func() {
 		defer wg.Done()
-		t := queryProcessTree()
+		t, c := queryProcessTree()
 		mu.Lock()
 		processTree = t
+		processComm = c
 		mu.Unlock()
 	}()
 
@@ -460,15 +514,25 @@ func fetchAll() fetchResult {
 	// and one round-trip pulls buffers + windows + session state.
 	capture := collectNvimState(tmuxPanes, processTree)
 
+	// compute which pane PIDs have a productive process somewhere in
+	// their descendant tree. this handles wrapper scripts and any
+	// nesting depth — the fast check on pane_current_command alone
+	// misses panes where the productive binary is a grandchild.
+	if processTree != nil && processComm != nil {
+		productivePanePIDs = resolveProductivePanePIDs(tmuxPanes, processTree, processComm)
+	}
+
 	return fetchResult{
-		spaces:       spaces,
-		windows:      windows,
-		tmuxPanes:    tmuxPanes,
-		tmuxClients:  tmuxClients,
-		processTree:  processTree,
-		nvimBuffers:  capture.PerPaneBuffers,
-		nvimWindows:  capture.Windows,
-		nvimSessions: capture.Sessions,
-		playingMeta:  playingMeta,
+		spaces:             spaces,
+		windows:            windows,
+		tmuxPanes:          tmuxPanes,
+		tmuxClients:        tmuxClients,
+		processTree:        processTree,
+		processComm:        processComm,
+		productivePanePIDs: productivePanePIDs,
+		nvimBuffers:        capture.PerPaneBuffers,
+		nvimWindows:        capture.Windows,
+		nvimSessions:       capture.Sessions,
+		playingMeta:        playingMeta,
 	}
 }

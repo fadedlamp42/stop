@@ -68,13 +68,14 @@ type spaceRow struct {
 
 type model struct {
 	// raw data from queries
-	spaces      []Space
-	windows     []Window
-	tmuxPanes   []TmuxPane
-	tmuxClients []TmuxClient
-	processTree map[int]int
-	nvimBuffers map[int][]NvimBuffer // pane_pid → open buffers
-	playingMeta PlayingMeta          // latest player sample; renderer interpolates from this
+	spaces              []Space
+	windows             []Window
+	tmuxPanes           []TmuxPane
+	tmuxClients         []TmuxClient
+	processTree         map[int]int
+	productivePanePIDs  map[int]bool
+	nvimBuffers         map[int][]NvimBuffer // pane_pid → open buffers
+	playingMeta         PlayingMeta          // latest player sample; renderer interpolates from this
 
 	// derived (rebuilt on each data refresh)
 	displayGroups []displayGroup
@@ -188,6 +189,7 @@ func (m model) handleData(result fetchResult) (tea.Model, tea.Cmd) {
 	m.tmuxPanes = result.tmuxPanes
 	m.tmuxClients = result.tmuxClients
 	m.processTree = result.processTree
+	m.productivePanePIDs = result.productivePanePIDs
 	m.nvimBuffers = result.nvimBuffers
 	m.playingMeta = result.playingMeta
 

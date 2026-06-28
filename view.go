@@ -64,7 +64,7 @@ func (m model) View() string {
 
 	// compute per-session staleness for bubbling up to space rows.
 	// uses most recent pane activity per session (freshest pane wins).
-	productiveActivity := bestProductiveActivity(m.tmuxPanes)
+	productiveActivity := bestProductiveActivity(m.tmuxPanes, m.productivePanePIDs)
 
 	// render each display as a separate column
 	colStyle := lipgloss.NewStyle().Width(colWidth)
@@ -74,7 +74,7 @@ func (m model) View() string {
 		if i == m.cursorCol {
 			activeRow = m.cursorRow
 		}
-		col := renderDisplayColumn(dg, activeRow, colWidth, m.tmuxByDisplay[dg.index], productiveActivity, m.nvimBuffers)
+		col := renderDisplayColumn(dg, activeRow, colWidth, m.tmuxByDisplay[dg.index], productiveActivity, m.productivePanePIDs, m.nvimBuffers)
 		styledColumns = append(styledColumns, colStyle.Render(col))
 	}
 
@@ -112,7 +112,7 @@ func (m model) View() string {
 	}
 
 	if len(m.detachedTmux) > 0 {
-		top.WriteString(renderTmuxSessions(m.detachedTmux, "detached", m.nvimBuffers))
+		top.WriteString(renderTmuxSessions(m.detachedTmux, "detached", m.nvimBuffers, m.productivePanePIDs))
 	}
 
 	nowPlayingDisplay := m.playingMeta.DisplayString()
@@ -183,7 +183,7 @@ func countLines(s string) int {
 
 // -- column rendering --
 
-func renderDisplayColumn(dg displayGroup, cursorRow int, colWidth int, tmuxPanes []TmuxPane, productiveActivity map[string]time.Time, nvimBuffers map[int][]NvimBuffer) string {
+func renderDisplayColumn(dg displayGroup, cursorRow int, colWidth int, tmuxPanes []TmuxPane, productiveActivity map[string]time.Time, productivePanePIDs map[int]bool, nvimBuffers map[int][]NvimBuffer) string {
 	var b strings.Builder
 
 	// header
@@ -210,7 +210,7 @@ func renderDisplayColumn(dg displayGroup, cursorRow int, colWidth int, tmuxPanes
 		relIdx := i + 1
 		absIdx := row.space.Index
 		isSelected := i == cursorRow
-		b.WriteString(renderSpaceRow(row, relIdx, absIdx, isSelected, maxTitleLen, productiveActivity, tmuxBySession, nvimBuffers))
+		b.WriteString(renderSpaceRow(row, relIdx, absIdx, isSelected, maxTitleLen, productiveActivity, tmuxBySession, nvimBuffers, productivePanePIDs))
 		b.WriteString("\n")
 	}
 
@@ -229,7 +229,7 @@ func renderDisplayColumn(dg displayGroup, cursorRow int, colWidth int, tmuxPanes
 
 // -- row rendering --
 
-func renderSpaceRow(row spaceRow, relIdx, absIdx int, isSelected bool, maxTitleLen int, productiveActivity map[string]time.Time, tmuxBySession map[string][]TmuxPane, nvimBuffers map[int][]NvimBuffer) string {
+func renderSpaceRow(row spaceRow, relIdx, absIdx int, isSelected bool, maxTitleLen int, productiveActivity map[string]time.Time, tmuxBySession map[string][]TmuxPane, nvimBuffers map[int][]NvimBuffer, productivePanePIDs map[int]bool) string {
 	cursor := "  "
 	if isSelected {
 		cursor = cursorStyle.Render("> ")
@@ -300,7 +300,7 @@ func renderSpaceRow(row spaceRow, relIdx, absIdx int, isSelected bool, maxTitleL
 			var bestProductive time.Time
 			windowHasProductive := false
 			for _, p := range win.panes {
-				if isProductive(p.CurrentCommand) {
+				if productivePanePIDs[p.PanePID] {
 					if !windowHasProductive || p.LastActivity.After(bestProductive) {
 						bestProductive = p.LastActivity
 						windowHasProductive = true
@@ -319,7 +319,7 @@ func renderSpaceRow(row spaceRow, relIdx, absIdx int, isSelected bool, maxTitleL
 			// panes inline after window label
 			for _, p := range win.panes {
 				style := dimStyle
-				if isProductive(p.CurrentCommand) {
+				if productivePanePIDs[p.PanePID] {
 					style = stalenessStyle(p.LastActivity)
 				}
 				line.WriteString("  ")
@@ -451,13 +451,14 @@ func truncateStr(s string, maxLen int) string {
 // -- tmux staleness --
 
 // bestProductiveActivity maps session name → most recent productive pane activity.
-// only panes running a productive command (see config.go) contribute.
+// productive is determined by the precomputed productivePanePIDs set, which
+// checks both pane_current_command and process tree descendants.
 // used to color terminal entries and space index numbers — non-productive
 // panes are ignored since their staleness is meaningless.
-func bestProductiveActivity(panes []TmuxPane) map[string]time.Time {
+func bestProductiveActivity(panes []TmuxPane, productivePanePIDs map[int]bool) map[string]time.Time {
 	result := make(map[string]time.Time)
 	for _, p := range panes {
-		if !isProductive(p.CurrentCommand) {
+		if !productivePanePIDs[p.PanePID] {
 			continue
 		}
 		if existing, ok := result[p.SessionName]; !ok || p.LastActivity.After(existing) {
@@ -616,7 +617,7 @@ func formatHistorySize(lines int) string {
 // renderTmuxSessions renders tmux panes grouped by session with staleness
 // coloring, scroll buffer sizes, and time since last activity.
 // header is the section label (e.g. "tmux" or "detached").
-func renderTmuxSessions(panes []TmuxPane, header string, nvimBuffers map[int][]NvimBuffer) string {
+func renderTmuxSessions(panes []TmuxPane, header string, nvimBuffers map[int][]NvimBuffer, productivePanePIDs map[int]bool) string {
 	if len(panes) == 0 {
 		return ""
 	}
@@ -638,7 +639,7 @@ func renderTmuxSessions(panes []TmuxPane, header string, nvimBuffers map[int][]N
 			var bestProductive time.Time
 			windowHasProductive := false
 			for _, p := range window.panes {
-				if isProductive(p.CurrentCommand) {
+				if productivePanePIDs[p.PanePID] {
 					if !windowHasProductive || p.LastActivity.After(bestProductive) {
 						bestProductive = p.LastActivity
 						windowHasProductive = true
@@ -656,7 +657,7 @@ func renderTmuxSessions(panes []TmuxPane, header string, nvimBuffers map[int][]N
 			// panes inline on the same line as the window header
 			for _, p := range window.panes {
 				style := dimStyle
-				if isProductive(p.CurrentCommand) {
+				if productivePanePIDs[p.PanePID] {
 					style = stalenessStyle(p.LastActivity)
 				}
 				timeStr := formatRelativeTime(p.LastActivity)
